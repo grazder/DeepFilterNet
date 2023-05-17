@@ -966,6 +966,7 @@ dependencies = [
  "log",
  "ndarray",
  "ringbuf",
+ "rubato",
 ]
 
 [[package]]
