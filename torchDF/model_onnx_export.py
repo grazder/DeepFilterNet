@@ -10,7 +10,7 @@ import numpy as np
 import onnxruntime as ort
 import torch.utils.benchmark as benchmark
 
-from torch_df_streaming import TorchDFPipeline
+from torch_df_streaming_minimal import TorchDFMinimalPipeline
 from typing import Dict, Iterable
 
 torch.manual_seed(0)
@@ -19,7 +19,6 @@ FRAME_SIZE = 480
 INPUT_NAMES = [
     'input_frame', 
     'states',
-    'atten_lim_db'
 ]
 OUTPUT_NAMES = [
     'enhanced_audio_frame', 'out_states', 'lsnr'
@@ -53,7 +52,7 @@ def onnx_simplify(
     onnx.save_model(model_simp, path)
     return path
 
-def test_onnx_model(torch_model, ort_session, states, atten_lim_db):
+def test_onnx_model(torch_model, ort_session, states):
     """
     Simple test that everything converted correctly
 
@@ -69,12 +68,12 @@ def test_onnx_model(torch_model, ort_session, states, atten_lim_db):
         input_frame = torch.randn(FRAME_SIZE)
 
         # torch
-        output_torch = torch_model(input_frame, states_torch, atten_lim_db)
+        output_torch = torch_model(input_frame, states_torch)
 
         # onnx
         output_onnx = ort_session.run(
             OUTPUT_NAMES,
-            generate_onnx_features([input_frame, states_onnx, atten_lim_db]),
+            generate_onnx_features([input_frame, states_onnx]),
         )
 
         for (x, y, name) in zip(output_torch, output_onnx, OUTPUT_NAMES):
@@ -133,14 +132,13 @@ def infer_onnx_model(streaming_pipeline, ort_session, inference_path):
     )    
 
 def main(args):
-    streaming_pipeline = TorchDFPipeline(always_apply_all_stages=args.always_apply_all_stages, device='cpu')
+    streaming_pipeline = TorchDFMinimalPipeline(device='cpu')
     torch_df = streaming_pipeline.torch_streaming_model
     states = streaming_pipeline.states
-    atten_lim_db = streaming_pipeline.atten_lim_db
 
     input_frame = torch.rand(FRAME_SIZE)
     input_features = (
-        input_frame, states, atten_lim_db
+        input_frame, states
     )
     torch_df(*input_features) # check model
 
@@ -194,7 +192,7 @@ def main(args):
     print(f'InferenceSession successful! Output shapes: {[x.shape for x in onnx_outputs]}')
 
     if args.test:
-        test_onnx_model(torch_df, ort_session, input_features[1], input_features[2])
+        test_onnx_model(torch_df, ort_session, input_features[1])
         print('Tests passed!')
 
     if args.performance:
