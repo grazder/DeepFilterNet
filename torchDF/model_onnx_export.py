@@ -12,7 +12,14 @@ import torch.utils.benchmark as benchmark
 from torch_df_streaming_minimal import TorchDFMinimalPipeline
 from typing import Dict, Iterable
 from torch.profiler import profile, ProfilerActivity
-from onnxruntime.quantization import quantize_dynamic, QuantType, shape_inference
+from onnxruntime.quantization import (
+    quantize_dynamic,
+    quantize_static,
+    QuantType,
+    QuantFormat,
+    shape_inference,
+)
+from onnx_data_reader import DeepFilterNetDataReader
 
 # Error with compatability - https://github.com/microsoft/onnxruntime/issues/19323
 onnx.helper.make_sequence_value_info = onnx.helper.make_tensor_sequence_value_info
@@ -23,7 +30,7 @@ FRAME_SIZE = 480
 INPUT_NAMES = [
     "input_frame",
 ]
-OUTPUT_NAMES = ["enhanced_audio_frame", "out_states"]
+OUTPUT_NAMES = ["enhanced_audio_frame"]
 
 
 def onnx_simplify(
@@ -200,9 +207,20 @@ def main(args):
 
     print(f"Model preprocessed for quantization - {args.output_path}!")
 
-    quantize_dynamic(args.output_path, args.output_path, weight_type=QuantType.QUInt8)
+    # quantize_dynamic(args.output_path, args.output_path, weight_type=QuantType.QInt8)
+    # print(f"Model dynamic quantized - {args.output_path}!")
 
-    print(f"Model quantized - {args.output_path}!")
+    dr = DeepFilterNetDataReader(args.inference_path, args.output_path)
+
+    quantize_static(
+        args.output_path,
+        args.output_path,
+        dr,
+        quant_format=QuantFormat.QDQ,
+        per_channel=False,
+        weight_type=QuantType.QInt8,
+    )
+    print(f"Model static quantized - {args.output_path}!")
 
     input_features_onnx = generate_onnx_features(input_features)
     input_shapes_dict = {x: y.shape for x, y in input_features_onnx.items()}
@@ -261,9 +279,9 @@ def main(args):
         print("Performanse check...")
         perform_benchmark(ort_session, input_features_onnx)
 
-    if args.inference_path:
-        infer_onnx_model(streaming_pipeline, ort_session, args.inference_path)
-        print(f"Audio from {args.inference_path} enhanced!")
+    # if args.inference_path:
+    #     infer_onnx_model(streaming_pipeline, ort_session, args.inference_path)
+    #     print(f"Audio from {args.inference_path} enhanced!")
 
 
 if __name__ == "__main__":

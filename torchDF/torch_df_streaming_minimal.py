@@ -445,7 +445,7 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         return gain_spec
 
     def unpack_states(
-        self, states: Tensor
+        self,
     ) -> Tuple[
         Tensor,
         Tensor,
@@ -460,24 +460,20 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         Tensor,
         Tensor,
     ]:
-        splitted_states = torch.split(states, self.state_lens)
+        erb_norm_state = torch.zeros(self.erb_norm_state_shape)
+        band_unit_norm_state = torch.zeros(self.band_unit_norm_state_shape)
+        analysis_mem = torch.zeros(self.analysis_mem_shape)
+        synthesis_mem = torch.zeros(self.synthesis_mem_shape)
+        rolling_erb_buf = torch.zeros(self.rolling_erb_buf_shape)
+        rolling_feat_spec_buf = torch.zeros(self.rolling_feat_spec_buf_shape)
+        rolling_c0_buf = torch.zeros(self.rolling_c0_buf_shape)
+        rolling_spec_buf_x = torch.zeros(self.rolling_spec_buf_x_shape)
+        rolling_spec_buf_y = torch.zeros(self.rolling_spec_buf_y_shape)
+        enc_hidden = torch.zeros(self.enc_hidden_shape)
+        erb_dec_hidden = torch.zeros(self.erb_dec_hidden_shape)
+        df_dec_hidden = torch.zeros(self.df_dec_hidden_shape)
 
-        erb_norm_state = splitted_states[0].view(self.erb_norm_state_shape)
-        band_unit_norm_state = splitted_states[1].view(self.band_unit_norm_state_shape)
-        analysis_mem = splitted_states[2].view(self.analysis_mem_shape)
-        synthesis_mem = splitted_states[3].view(self.synthesis_mem_shape)
-        rolling_erb_buf = splitted_states[4].view(self.rolling_erb_buf_shape)
-        rolling_feat_spec_buf = splitted_states[5].view(
-            self.rolling_feat_spec_buf_shape
-        )
-        rolling_c0_buf = splitted_states[6].view(self.rolling_c0_buf_shape)
-        rolling_spec_buf_x = splitted_states[7].view(self.rolling_spec_buf_x_shape)
-        rolling_spec_buf_y = splitted_states[8].view(self.rolling_spec_buf_y_shape)
-        enc_hidden = splitted_states[9].view(self.enc_hidden_shape)
-        erb_dec_hidden = splitted_states[10].view(self.erb_dec_hidden_shape)
-        df_dec_hidden = splitted_states[11].view(self.df_dec_hidden_shape)
-
-        new_erb_norm_state = (
+        erb_norm_state = (
             torch.linspace(
                 self.linspace_erb[0],
                 self.linspace_erb[1],
@@ -485,9 +481,10 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
                 device=erb_norm_state.device,
             )
             .view(self.erb_norm_state_shape)
-            .to(states.dtype)
-        )  # float() to fix export issue
-        new_band_unit_norm_state = (
+            .float()
+        )
+
+        band_unit_norm_state = (
             torch.linspace(
                 self.linspace_df[0],
                 self.linspace_df[1],
@@ -495,20 +492,8 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
                 device=band_unit_norm_state.device,
             )
             .view(self.band_unit_norm_state_shape)
-            .to(states.dtype)
+            .float()
         )  # float() to fix export issue
-
-        erb_norm_state = torch.where(
-            torch.tensor(torch.nonzero(erb_norm_state).shape[0] == 0),
-            new_erb_norm_state,
-            erb_norm_state,
-        )
-
-        band_unit_norm_state = torch.where(
-            torch.tensor(torch.nonzero(band_unit_norm_state).shape[0] == 0),
-            new_band_unit_norm_state,
-            band_unit_norm_state,
-        )
 
         return (
             erb_norm_state,
@@ -529,7 +514,7 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         self,
         input_frame: Tensor,
         # states: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> Tensor:
         """
         Enhancing input audio frame
 
@@ -547,7 +532,6 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         ), "input_frame must be bs=1 and t=frame_size"
 
         # with profiler.record_function("UNPACK"):
-        states = torch.zeros(self.states_full_len)
         (
             erb_norm_state,
             band_unit_norm_state,
@@ -561,7 +545,7 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
             enc_hidden,
             erb_dec_hidden,
             df_dec_hidden,
-        ) = self.unpack_states(states)
+        ) = self.unpack_states()
 
         # with profiler.record_function("FRAME_ANALYSIS"):
         spectrogram, new_analysis_mem = self.frame_analysis(input_frame, analysis_mem)
@@ -633,23 +617,23 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
             current_spec, synthesis_mem
         )
 
-        new_states = [
-            new_erb_norm_state,
-            new_band_unit_norm_state,
-            new_analysis_mem,
-            new_synthesis_mem,
-            new_rolling_erb_buf,
-            new_rolling_feat_spec_buf,
-            new_rolling_c0_buf,
-            new_rolling_spec_buf_x,
-            new_rolling_spec_buf_y,
-            new_enc_hidden,
-            new_erb_dec_hidden,
-            new_df_dec_hidden,
-        ]
-        new_states = torch.cat([x.flatten() for x in new_states])
+        # new_states = [
+        #     new_erb_norm_state,
+        #     new_band_unit_norm_state,
+        #     new_analysis_mem,
+        #     new_synthesis_mem,
+        #     new_rolling_erb_buf,
+        #     new_rolling_feat_spec_buf,
+        #     new_rolling_c0_buf,
+        #     new_rolling_spec_buf_x,
+        #     new_rolling_spec_buf_y,
+        #     new_enc_hidden,
+        #     new_erb_dec_hidden,
+        #     new_df_dec_hidden,
+        # ]
+        # new_states = torch.cat([x.flatten() for x in new_states])
 
-        return enhanced_audio_frame, new_states
+        return enhanced_audio_frame
 
 
 class TorchDFMinimalPipeline(nn.Module):
@@ -727,10 +711,7 @@ class TorchDFMinimalPipeline(nn.Module):
         output_frames = []
 
         for input_frame in chunked_audio:
-            enhanced_audio_frame, self.states = self.torch_streaming_model(
-                input_frame,
-                self.states,
-            )
+            enhanced_audio_frame = self.torch_streaming_model(input_frame)
 
             output_frames.append(enhanced_audio_frame)
 
