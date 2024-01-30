@@ -22,6 +22,7 @@ dependencies = [
  "ndarray",
  "numpy",
  "pyo3",
+ "tract-core",
 ]
 
 [[package]]

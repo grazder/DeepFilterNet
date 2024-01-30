@@ -1,4 +1,3 @@
-import os
 import copy
 import onnx
 import argparse
@@ -13,15 +12,18 @@ import torch.utils.benchmark as benchmark
 from torch_df_streaming_minimal import TorchDFMinimalPipeline
 from typing import Dict, Iterable
 from torch.profiler import profile, ProfilerActivity
+from onnxruntime.quantization import quantize_dynamic, QuantType, shape_inference
+
+# Error with compatability - https://github.com/microsoft/onnxruntime/issues/19323
+onnx.helper.make_sequence_value_info = onnx.helper.make_tensor_sequence_value_info
 
 torch.manual_seed(0)
 
 FRAME_SIZE = 480
 INPUT_NAMES = [
     "input_frame",
-    "states",
 ]
-OUTPUT_NAMES = ["enhanced_audio_frame", "out_states", "lsnr"]
+OUTPUT_NAMES = ["enhanced_audio_frame", "out_states"]
 
 
 def onnx_simplify(
@@ -65,8 +67,7 @@ def test_onnx_model(torch_model, ort_session, states):
     states_onnx = copy.deepcopy(states)
 
     for i in range(30):
-        input_frame = torch.randn(FRAME_SIZE).cuda().half()
-
+        input_frame = torch.randn(FRAME_SIZE)
         # torch
         output_torch = torch_model(input_frame, states_torch)
 
@@ -77,7 +78,7 @@ def test_onnx_model(torch_model, ort_session, states):
         )
 
         for x, y, name in zip(output_torch, output_onnx, OUTPUT_NAMES):
-            y_tensor = torch.from_numpy(y).cuda().half()
+            y_tensor = torch.from_numpy(y)
             assert torch.allclose(
                 x, y_tensor, atol=1e-2
             ), f"out {name} - {i}, {x.flatten()[-5:]}, {y_tensor.flatten()[-5:]}"
@@ -151,30 +152,27 @@ def trace_handler(prof):
 def main(args):
     streaming_pipeline = TorchDFMinimalPipeline(device="cpu")
     torch_df = streaming_pipeline.torch_streaming_model
-    states = streaming_pipeline.states
-
-    torch_df = torch_df.half()
+    # states = streaming_pipeline.states
 
     model_parameters = filter(lambda p: p.requires_grad, torch_df.parameters())
     params = sum([np.prod(p.size()) for p in model_parameters])
     print("Number of params:", params // 1e6, "M")
 
     input_frame = torch.rand(FRAME_SIZE)
-    input_features = (input_frame.half(), states.half())
+    input_features = [input_frame]
     torch_df(*input_features)  # check model
 
-    def apply_model(model, features):
-        model(*features)
-
-    with profile(
-        activities=[ProfilerActivity.CPU],
-        schedule=torch.profiler.schedule(wait=1, warmup=1, active=2),
-        on_trace_ready=trace_handler,
-        record_shapes=True,
-    ) as prof:
-        for _ in range(8):
-            apply_model(torch_df, input_features)
-            prof.step()
+    # def apply_model(model, features):
+    #     model(*features)
+    # with profile(
+    #     activities=[ProfilerActivity.CPU],
+    #     schedule=torch.profiler.schedule(wait=1, warmup=1, active=2),
+    #     on_trace_ready=trace_handler,
+    #     record_shapes=True,
+    # ) as prof:
+    #     for _ in range(8):
+    #         apply_model(torch_df, input_features)
+    #         prof.step()
 
     torch_df_script = torch.jit.script(torch_df)
     torch.onnx.export(
@@ -185,8 +183,26 @@ def main(args):
         input_names=INPUT_NAMES,
         output_names=OUTPUT_NAMES,
         opset_version=14,
+        export_params=True,
+        do_constant_folding=True,
     )
     print(f"Model exported to {args.output_path}!")
+
+    onnx.checker.check_model(onnx.load(args.output_path), full_check=True)
+
+    print(f"Model {args.output_path} checked!")
+
+    shape_inference.quant_pre_process(
+        args.output_path,
+        args.output_path,
+        skip_symbolic_shape=False,
+    )
+
+    print(f"Model preprocessed for quantization - {args.output_path}!")
+
+    quantize_dynamic(args.output_path, args.output_path, weight_type=QuantType.QUInt8)
+
+    print(f"Model quantized - {args.output_path}!")
 
     input_features_onnx = generate_onnx_features(input_features)
     input_shapes_dict = {x: y.shape for x, y in input_features_onnx.items()}

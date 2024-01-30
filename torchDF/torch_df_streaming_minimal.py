@@ -30,11 +30,6 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         conv_lookahead=2,
         nb_df=96,
         alpha=0.99,
-        min_db_thresh=-10.0,
-        max_db_erb_thresh=30.0,
-        max_db_df_thresh=20.0,
-        normalize_atten_lim=20.0,
-        silence_thresh=1e-7,
         sr=48000,
     ):
         # All complex numbers are stored as floats for ONNX compatibility
@@ -135,6 +130,8 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         self.linspace_erb = [-60.0, -90.0]
         self.linspace_df = [0.001, 0.0001]
 
+        # Shapes
+
         self.erb_norm_state_shape = (self.nb_bands,)
         self.band_unit_norm_state_shape = (
             1,
@@ -204,12 +201,6 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         ]
         self.state_lens = [math.prod(x) for x in state_shapes]
         self.states_full_len = sum(self.state_lens)
-
-        # Zero buffers
-        self.register_buffer("zero_gains", torch.zeros(self.nb_bands))
-        self.register_buffer(
-            "zero_coefs", torch.zeros(self.rolling_c0_buf_shape[2], self.nb_df, 2)
-        )
 
     @staticmethod
     def remove_conv_block_padding(original_conv: nn.Module) -> nn.Module:
@@ -537,8 +528,8 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
     def forward(
         self,
         input_frame: Tensor,
-        states: Tensor,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
+        # states: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
         """
         Enhancing input audio frame
 
@@ -549,8 +540,6 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         Returns:
             enhanced_frame:     Float[t] - Enhanced audio frame
             new_states:         Float[state_len] - Flattened and concated updated states
-            lsnr:               Float[1] - Estimated lsnr of input frame
-
         """
         assert input_frame.ndim == 1, "only bs=1 and t=frame_size supported"
         assert (
@@ -558,6 +547,7 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         ), "input_frame must be bs=1 and t=frame_size"
 
         # with profiler.record_function("UNPACK"):
+        states = torch.zeros(self.states_full_len)
         (
             erb_norm_state,
             band_unit_norm_state,
@@ -609,10 +599,9 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
             [rolling_feat_spec_buf[:, :, 1:, :], spec_feat], dim=2
         )
 
-        e0, e1, e2, e3, emb, c0, lsnr, new_enc_hidden = self.enc(
+        e0, e1, e2, e3, emb, c0, _, new_enc_hidden = self.enc(
             new_rolling_erb_buf, new_rolling_feat_spec_buf, enc_hidden
         )
-        lsnr = lsnr.flatten()  # [b=1, t=1, 1] -> 1
 
         # with profiler.record_function("ERB_DEC"):
         # erb_dec
@@ -660,7 +649,7 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         ]
         new_states = torch.cat([x.flatten() for x in new_states])
 
-        return enhanced_audio_frame, new_states, lsnr
+        return enhanced_audio_frame, new_states
 
 
 class TorchDFMinimalPipeline(nn.Module):
@@ -738,7 +727,7 @@ class TorchDFMinimalPipeline(nn.Module):
         output_frames = []
 
         for input_frame in chunked_audio:
-            (enhanced_audio_frame, self.states, lsnr) = self.torch_streaming_model(
+            enhanced_audio_frame, self.states = self.torch_streaming_model(
                 input_frame,
                 self.states,
             )
