@@ -160,7 +160,9 @@ def main(args):
         output_names=OUTPUT_NAMES,
         opset_version=14,
     )
+    # torch.onnx.dynamo_export(torch_df, *input_features).save(args.output_path)
     print(f"Model exported to {args.output_path}!")
+    # raise Exception()
 
     input_features_onnx = generate_onnx_features(input_features)
     input_shapes_dict = {x: y.shape for x, y in input_features_onnx.items()}
@@ -181,6 +183,7 @@ def main(args):
                     args.output_path,
                     "--optimization_style",
                     "Fixed",
+                    
                 ]
             ).returncode
             != 0
