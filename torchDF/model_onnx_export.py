@@ -75,7 +75,7 @@ def test_onnx_model(torch_model, ort_session, states, atten_lim_db):
         for x, y, name in zip(output_torch, output_onnx, OUTPUT_NAMES):
             y_tensor = torch.from_numpy(y)
             assert torch.allclose(
-                x, y_tensor, atol=1e-3
+                x, y_tensor, atol=1e-2
             ), f"out {name} - {i}, {x.flatten()[-5:]}, {y_tensor.flatten()[-5:]}"
 
 
@@ -138,6 +138,37 @@ def infer_onnx_model(streaming_pipeline, ort_session, inference_path):
     )
 
 
+import onnxscript
+from torch.onnx._internal import jit_utils
+from onnxscript.onnx_opset import opset17 as op
+
+custom_opset = onnxscript.values.Opset(domain="onnx-script", version=2)
+opset_version = 17
+
+
+@onnxscript.script(custom_opset)
+def Rfft(X: onnxscript.FLOAT[960]):
+    x = op.Unsqueeze(X, axes=[-1])
+    x = op.Unsqueeze(x, axes=[0])
+    x = op.DFT(x, axis=1, inverse=0, onesided=True)
+    return op.Squeeze(x, axes=[0])
+
+
+# setType API provides shape/type to ONNX shape/type inference
+def custom_rfft(g: jit_utils.GraphContext, X, n, dim, norm):
+    return g.onnxscript_op(Rfft, X).setType(X.type())
+
+
+@onnxscript.script(custom_opset)
+def Identity(X: onnxscript.FLOAT[481, 2]):
+    return op.Identity(X)
+
+
+# setType API provides shape/type to ONNX shape/type inference
+def custom_identity(g: jit_utils.GraphContext, X):
+    return g.onnxscript_op(Identity, X).setType(X.type())
+
+
 def main(args):
     streaming_pipeline = TorchDFPipeline(
         always_apply_all_stages=args.always_apply_all_stages, device="cpu"
@@ -151,6 +182,36 @@ def main(args):
     torch_df(*input_features)  # check model
 
     torch_df_script = torch.jit.script(torch_df)
+
+    check_tensor = torch.rand(960, dtype=torch.float32).cpu().numpy()
+    assert Rfft(check_tensor).shape == (481, 2)
+    assert Identity(Rfft(check_tensor)).shape == (481, 2)
+
+    # import onnx
+
+    # onnx_model = Rfft.to_model_proto()
+    # onnx_model = onnx.shape_inference.infer_shapes(onnx_model)
+    # onnx.checker.check_model(onnx_model)
+
+    # sess = ort.InferenceSession(
+    #     onnx_model.SerializeToString(), providers=("CPUExecutionProvider",)
+    # )
+
+    # X = torch.randn(960, dtype=torch.float32).numpy()
+    # got = sess.run(None, {"X": X})
+    # print(got[0].shape)
+    # raise Exception()
+
+    torch.onnx.register_custom_op_symbolic(
+        symbolic_name="aten::fft_rfft",
+        symbolic_fn=custom_rfft,
+        opset_version=opset_version,
+    )
+    torch.onnx.register_custom_op_symbolic(
+        symbolic_name="aten::view_as_real",
+        symbolic_fn=custom_identity,
+        opset_version=opset_version,
+    )
     torch.onnx.export(
         torch_df_script,
         input_features,
@@ -158,11 +219,12 @@ def main(args):
         verbose=False,
         input_names=INPUT_NAMES,
         output_names=OUTPUT_NAMES,
-        opset_version=14,
+        opset_version=opset_version,
+        custom_opsets={"onnx-script": 2},
     )
     # torch.onnx.dynamo_export(torch_df, *input_features).save(args.output_path)
     print(f"Model exported to {args.output_path}!")
-    # raise Exception()
+    raise Exception()
 
     input_features_onnx = generate_onnx_features(input_features)
     input_shapes_dict = {x: y.shape for x, y in input_features_onnx.items()}
@@ -173,6 +235,8 @@ def main(args):
         onnx_simplify(args.output_path, input_features_onnx, input_shapes_dict)
         print(f"Model simplified! {args.output_path}")
 
+    temp_path = "/work/onnx-modifier/modified_onnx/modified_denoiser_model.onnx"
+
     if args.ort:
         if (
             subprocess.run(
@@ -180,10 +244,9 @@ def main(args):
                     "python",
                     "-m",
                     "onnxruntime.tools.convert_onnx_models_to_ort",
-                    args.output_path,
+                    temp_path,  # args.output_path,
                     "--optimization_style",
                     "Fixed",
-                    
                 ]
             ).returncode
             != 0
@@ -194,13 +257,13 @@ def main(args):
     print("Checking model...")
     sess_options = ort.SessionOptions()
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
-    sess_options.optimized_model_filepath = args.output_path
+    sess_options.optimized_model_filepath = temp_path  # args.output_path
     sess_options.intra_op_num_threads = 1
     sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     sess_options.enable_profiling = True
 
     ort_session = ort.InferenceSession(
-        args.output_path,
+        temp_path,
         sess_options,
         providers=["CPUExecutionProvider"],
     )

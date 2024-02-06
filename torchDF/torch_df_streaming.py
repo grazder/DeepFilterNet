@@ -380,7 +380,8 @@ class ExportableStreamingTorchDF(nn.Module):
         # First part of the window on the previous frame
         # Second part of the window on the new input frame
         buf = torch.cat([analysis_mem, input_frame]) * self.window
-        rfft_buf = torch.matmul(buf, self.rfft_matrix) * self.wnorm
+        # rfft_buf = torch.matmul(buf, self.rfft_matrix) * self.wnorm
+        rfft_buf = torch.view_as_real(torch.fft.rfft(buf)) * self.wnorm
 
         # Copy input to analysis_mem for next iteration
         return rfft_buf, input_frame
