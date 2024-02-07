@@ -406,9 +406,8 @@ class ExportableStreamingTorchDF(nn.Module):
         # self.irfft_matrix - [fft_size=481, 2, f=960]
         # [f=960]
         x = (
-            torch.einsum("fi,fij->j", x, self.irfft_matrix)
-            * self.fft_size
-            * self.window
+            # torch.einsum("fi,fij->j", x, self.irfft_matrix) * self.fft_size * self.window
+            torch.fft.irfft(torch.view_as_complex(x)) * self.fft_size * self.window
         )
 
         x_first, x_second = torch.split(
