@@ -30,17 +30,16 @@ def generate_example_inputs(torch_df):
 
     chunked_audio = torch.split(input_audio, torch_df.hop_size)
     states = torch_df.states
-    atten_lim_db = torch_df.atten_lim_db
 
-    return chunked_audio[1], states, atten_lim_db
+    return chunked_audio[1], states
 
 
 def main():
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
 
-    torch_df = TorchDFPipeline(device=DEVICE, always_apply_all_stages=True)
-    frame, states, atten_lim_db = generate_example_inputs(torch_df)
+    torch_df = TorchDFPipeline(device=DEVICE)
+    frame, states = generate_example_inputs(torch_df)
 
     streaming_model = torch_df.torch_streaming_model
     (
@@ -58,7 +57,7 @@ def main():
         df_dec_hidden,
     ) = streaming_model.unpack_states(states)
 
-    _, new_states, _ = streaming_model(frame, states, atten_lim_db)
+    _, new_states, _ = streaming_model(frame, states)
     (
         new_erb_norm_state,
         new_band_unit_norm_state,

@@ -18,7 +18,7 @@ torch.manual_seed(0)
 
 FRAME_SIZE = 480
 OPSET_VERSION = 17
-INPUT_NAMES = ["input_frame", "states", "atten_lim_db"]
+INPUT_NAMES = ["input_frame", "states"]
 OUTPUT_NAMES = ["enhanced_audio_frame", "out_states", "lsnr"]
 
 
@@ -50,7 +50,7 @@ def onnx_simplify(
     return path
 
 
-def test_onnx_model(torch_model, ort_session, states, atten_lim_db):
+def test_onnx_model(torch_model, ort_session, states):
     """
     Simple test that everything converted correctly
 
@@ -66,12 +66,12 @@ def test_onnx_model(torch_model, ort_session, states, atten_lim_db):
         input_frame = torch.randn(FRAME_SIZE)
 
         # torch
-        output_torch = torch_model(input_frame, states_torch, atten_lim_db)
+        output_torch = torch_model(input_frame, states_torch)
 
         # onnx
         output_onnx = ort_session.run(
             OUTPUT_NAMES,
-            generate_onnx_features([input_frame, states_onnx, atten_lim_db]),
+            generate_onnx_features([input_frame, states_onnx]),
         )
 
         for x, y, name in zip(output_torch, output_onnx, OUTPUT_NAMES):
@@ -140,18 +140,6 @@ def infer_onnx_model(streaming_pipeline, ort_session, inference_path):
     )
 
 
-from onnxscript import FLOAT, script
-from onnxscript import opset17 as op
-
-
-@script()
-def Irfft(X: FLOAT[481, 2]):
-    x = op.Unsqueeze(X, [0])
-    x = op.DFT(x, axis=1, inverse=1, onesided=0)
-    x = op.Squeeze(x, [0])
-    return x
-
-
 # setType API provides shape/type to ONNX shape/type inference
 def custom_rfft(g: jit_utils.GraphContext, X, n, dim, norm):
     x = g.op(
@@ -174,54 +162,77 @@ def custom_rfft(g: jit_utils.GraphContext, X, n, dim, norm):
     return x
 
 
+def custom_irfft(g: jit_utils.GraphContext, X: torch.Value, n, dim, norm):
+    x = g.op(
+        "Unsqueeze",
+        X,
+        g.op("Constant", value_t=torch.tensor([0], dtype=torch.int64)),
+    )
+    x = g.op(
+        "com.microsoft::Irfft",
+        X,
+        normalized_i=0,
+        onesided_i=1,
+        signal_ndim_i=1,
+    )
+    x = g.op(
+        "Squeeze",
+        x,
+        g.op("Constant", value_t=torch.tensor([0], dtype=torch.int64)),
+    )
+    return x
+
+
 # setType API provides shape/type to ONNX shape/type inference
 def custom_identity(g: jit_utils.GraphContext, X):
     return X
 
 
 def main(args):
-    streaming_pipeline = TorchDFPipeline(
-        always_apply_all_stages=args.always_apply_all_stages, device="cpu"
-    )
+    streaming_pipeline = TorchDFPipeline(device="cpu")
     torch_df = streaming_pipeline.torch_streaming_model
     states = streaming_pipeline.states
-    atten_lim_db = streaming_pipeline.atten_lim_db
 
     input_frame = torch.rand(FRAME_SIZE)
-    input_features = (input_frame, states, atten_lim_db)
+    input_features = (input_frame, states)
     torch_df(*input_features)  # check model
 
     torch_df_script = torch.jit.script(torch_df)
 
-    ####
-    ten = torch.randn(481, 2, dtype=torch.float32)
-    out_onnx = Irfft(ten.numpy())
-    out_torch = torch.fft.irfft(torch.view_as_complex(ten))
+    # ####
+    # ten = torch.randn(481, 2, dtype=torch.float32)
+    # out_onnx = Irfft(ten.numpy())
+    # out_torch = torch.fft.irfft(torch.view_as_complex(ten))
 
-    print(out_onnx.shape, out_torch.shape)
+    # print(out_onnx.shape, out_torch.shape)
 
-    print(out_onnx[:5])
-    print(out_torch[:5])
-    # print(out_onnx[-5:])
-    raise Exception()
+    # print(out_onnx[:5])
+    # print(out_torch[:5])
+    # # print(out_onnx[-5:])
+    # raise Exception()
 
     torch.onnx.register_custom_op_symbolic(
         symbolic_name="aten::fft_rfft",
         symbolic_fn=custom_rfft,
         opset_version=OPSET_VERSION,
     )
+    # torch.onnx.register_custom_op_symbolic(
+    #     symbolic_name="aten::fft_irfft",
+    #     symbolic_fn=custom_irfft,
+    #     opset_version=OPSET_VERSION,
+    # )
     # Only used with aten::fft_rfft, so it's useless in ONNX
     torch.onnx.register_custom_op_symbolic(
         symbolic_name="aten::view_as_real",
         symbolic_fn=custom_identity,
         opset_version=OPSET_VERSION,
     )
-    # Only used with aten::fft_irfft, so it's useless in ONNX
-    torch.onnx.register_custom_op_symbolic(
-        symbolic_name="aten::view_as_complex",
-        symbolic_fn=custom_identity,
-        opset_version=OPSET_VERSION,
-    )
+    # # Only used with aten::fft_irfft, so it's useless in ONNX
+    # torch.onnx.register_custom_op_symbolic(
+    #     symbolic_name="aten::view_as_complex",
+    #     symbolic_fn=custom_identity,
+    #     opset_version=OPSET_VERSION,
+    # )
 
     torch.onnx.export(
         torch_df_script,
@@ -231,8 +242,8 @@ def main(args):
         input_names=INPUT_NAMES,
         output_names=OUTPUT_NAMES,
         opset_version=OPSET_VERSION,
+        operator_export_type=torch.onnx.OperatorExportTypes.ONNX,
     )
-    # torch.onnx.dynamo_export(torch_df, *input_features).save(args.output_path)
     print(f"Model exported to {args.output_path}!")
 
     input_features_onnx = generate_onnx_features(input_features)
@@ -286,7 +297,7 @@ def main(args):
     )
 
     if args.test:
-        test_onnx_model(torch_df, ort_session, input_features[1], input_features[2])
+        test_onnx_model(torch_df, ort_session, input_features[1])
         print("Tests passed!")
 
     if args.performance:
@@ -315,7 +326,4 @@ if __name__ == "__main__":
     )
     parser.add_argument("--inference-path", type=str, help="Run inference on example")
     parser.add_argument("--ort", action="store_true", help="Save to ort format")
-    parser.add_argument(
-        "--always-apply-all-stages", action="store_true", help="Always apply stages"
-    )
     main(parser.parse_args())

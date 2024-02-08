@@ -35,12 +35,11 @@ class ExportableStreamingTorchDF(nn.Module):
         normalize_atten_lim=20.0,
         silence_thresh=1e-7,
         sr=48000,
-        always_apply_all_stages=False,
     ):
         # All complex numbers are stored as floats for ONNX compatibility
         super().__init__()
 
-        self.fft_size = fft_size
+        self.fft_size = torch.tensor(fft_size, dtype=torch.float32)
         self.frame_size = hop_size  # dimension "f" in Float[f]
         self.window_size = fft_size
         self.window_size_h = fft_size // 2
@@ -48,14 +47,15 @@ class ExportableStreamingTorchDF(nn.Module):
         self.wnorm = 1.0 / (self.window_size**2 / (2 * self.frame_size))
         self.df_order = df_order
         self.lookahead = lookahead
-        self.always_apply_all_stages = torch.tensor(always_apply_all_stages)
         self.sr = sr
 
         # Initialize the vorbis window: sin(pi/2*sin^2(pi*n/N))
         window = torch.sin(
             0.5 * torch.pi * (torch.arange(self.fft_size) + 0.5) / self.window_size_h
         )
-        window = torch.sin(0.5 * torch.pi * window**2)
+        window = torch.sin(
+            0.5 * torch.pi * window**2,
+        )
         self.register_buffer("window", window)
 
         self.nb_df = nb_df
@@ -406,69 +406,19 @@ class ExportableStreamingTorchDF(nn.Module):
         # self.irfft_matrix - [fft_size=481, 2, f=960]
         # [f=960]
         x = (
-            # torch.einsum("fi,fij->j", x, self.irfft_matrix) * self.fft_size * self.window
-            torch.fft.irfft(torch.view_as_complex(x)) * self.fft_size * self.window
+            torch.einsum("fi,fij->j", x, self.irfft_matrix)
+            * self.fft_size
+            * self.window
         )
+        # x = torch.fft.irfft(torch.view_as_complex(x)) * self.fft_size * self.window
 
         x_first, x_second = torch.split(
             x, [self.frame_size, self.window_size - self.frame_size]
         )
+
         output = x_first + synthesis_mem
 
-        return output, x_second
-
-    def is_apply_gains(self, lsnr: Tensor) -> Tensor:
-        """
-        Original code - libDF/src/tract.rs - is_apply_stages()
-        This code decomposed for better graph capturing
-
-        Parameters:
-            lsnr:   Tensor[Float] - predicted lsnr value
-
-        Returns:
-            output: Tensor[Bool] - whether to apply gains or not
-        """
-        if self.always_apply_all_stages:
-            return torch.ones_like(lsnr, dtype=torch.bool)
-
-        return torch.le(lsnr, self.max_db_erb_thresh) * torch.ge(
-            lsnr, self.min_db_thresh
-        )
-
-    def is_apply_gain_zeros(self, lsnr: Tensor) -> Tensor:
-        """
-        Original code - libDF/src/tract.rs - is_apply_stages()
-        This code decomposed for better graph capturing
-
-        Parameters:
-            lsnr:   Tensor[Float] - predicted lsnr value
-
-        Returns:
-            output: Tensor[Bool] - whether to apply gain_zeros or not
-        """
-        if self.always_apply_all_stages:
-            return torch.zeros_like(lsnr, dtype=torch.bool)
-
-        # Only noise detected, just apply a zero mask
-        return torch.ge(self.min_db_thresh, lsnr)
-
-    def is_apply_df(self, lsnr: Tensor) -> Tensor:
-        """
-        Original code - libDF/src/tract.rs - is_apply_stages()
-        This code decomposed for better graph capturing
-
-        Parameters:
-            lsnr:   Tensor[Float] - predicted lsnr value
-
-        Returns:
-            output: Tensor[Bool] - whether to apply deep filtering or not
-        """
-        if self.always_apply_all_stages:
-            return torch.ones_like(lsnr, dtype=torch.bool)
-
-        return torch.le(lsnr, self.max_db_df_thresh) * torch.ge(
-            lsnr, self.min_db_thresh
-        )
+        return output, x_second.view(self.window_size - self.frame_size)
 
     def apply_mask(self, spec: Tensor, gains: Tensor) -> Tensor:
         """
@@ -592,7 +542,7 @@ class ExportableStreamingTorchDF(nn.Module):
         )
 
     def forward(
-        self, input_frame: Tensor, states: Tensor, atten_lim_db: Tensor
+        self, input_frame: Tensor, states: Tensor
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Enhancing input audio frame
@@ -627,14 +577,6 @@ class ExportableStreamingTorchDF(nn.Module):
             erb_dec_hidden,
             df_dec_hidden,
         ) = self.unpack_states(states)
-
-        # If input_frame is silent, then do nothing and return zeros
-        rms_non_silence_condition = (
-            input_frame**2
-        ).sum() / self.frame_size >= self.silence_thresh
-        rms_non_silence_condition = torch.logical_or(
-            rms_non_silence_condition, self.always_apply_all_stages
-        )
 
         spectrogram, new_analysis_mem = self.frame_analysis(input_frame, analysis_mem)
         spectrogram = spectrogram.unsqueeze(
@@ -673,19 +615,12 @@ class ExportableStreamingTorchDF(nn.Module):
         )
         lsnr = lsnr.flatten()  # [b=1, t=1, 1] -> 1
 
-        apply_gains = self.is_apply_gains(lsnr)
-        apply_df = self.is_apply_df(lsnr)
-        apply_gain_zeros = self.is_apply_gain_zeros(lsnr)
-
         # erb_dec
         # [BS=1, 1, T=1, ERB]
         new_gains, new_erb_dec_hidden = self.erb_dec(
             emb, e3, e2, e1, e0, erb_dec_hidden
         )
-        gains = torch.where(apply_gains, new_gains.view(self.nb_bands), self.zero_gains)
-        new_erb_dec_hidden = torch.where(
-            apply_gains, new_erb_dec_hidden, erb_dec_hidden
-        )
+        gains = new_gains.view(self.nb_bands)
 
         # df_dec
         new_rolling_c0_buf = torch.cat([rolling_c0_buf[:, :, 1:, :], c0], dim=2)
@@ -693,35 +628,14 @@ class ExportableStreamingTorchDF(nn.Module):
         new_coefs, new_df_dec_hidden = self.df_dec(
             emb, new_rolling_c0_buf, df_dec_hidden
         )
-        new_rolling_c0_buf = torch.where(apply_df, new_rolling_c0_buf, rolling_c0_buf)
-        new_df_dec_hidden = torch.where(apply_df, new_df_dec_hidden, df_dec_hidden)
-        coefs = torch.where(
-            apply_df,
-            new_coefs.view(self.nb_df, -1, 2).permute(1, 0, 2),
-            self.zero_coefs,
-        )
+        coefs = new_coefs.view(self.nb_df, -1, 2).permute(1, 0, 2)
 
         # Applying features
         current_spec = new_rolling_spec_buf_y[self.df_order - 1]
-        current_spec = torch.where(
-            torch.logical_or(apply_gains, apply_gain_zeros),
-            self.apply_mask(current_spec.clone(), gains),
-            current_spec,
+        current_spec = self.apply_mask(current_spec.clone(), gains)
+        current_spec = self.deep_filter(
+            current_spec.clone(), coefs, new_rolling_spec_buf_x
         )
-        current_spec = torch.where(
-            apply_df,
-            self.deep_filter(current_spec.clone(), coefs, new_rolling_spec_buf_x),
-            current_spec,
-        )
-
-        # Mixing some noisy channel
-        # taken from https://github.com/Rikorose/DeepFilterNet/blob/59789e135cb5ed0eb86bb50e8f1be09f60859d5c/DeepFilterNet/df/enhance.py#L237
-        if torch.abs(atten_lim_db) > 0:
-            spec_noisy = rolling_spec_buf_x[
-                max(self.lookahead, self.df_order) - self.lookahead - 1
-            ]
-            lim = 10 ** (-torch.abs(atten_lim_db) / self.normalize_atten_lim)
-            current_spec = torch.lerp(current_spec, spec_noisy, lim)
 
         enhanced_audio_frame, new_synthesis_mem = self.frame_synthesis(
             current_spec, synthesis_mem
@@ -743,14 +657,6 @@ class ExportableStreamingTorchDF(nn.Module):
         ]
         new_states = torch.cat([x.flatten() for x in new_states])
 
-        # RMS conditioning for better ONNX graph
-        enhanced_audio_frame = torch.where(
-            rms_non_silence_condition,
-            enhanced_audio_frame,
-            torch.zeros_like(enhanced_audio_frame),
-        )
-        new_states = torch.where(rms_non_silence_condition, new_states, states)
-
         return enhanced_audio_frame, new_states, lsnr
 
 
@@ -764,8 +670,6 @@ class TorchDFPipeline(nn.Module):
         conv_lookahead=2,
         nb_df=96,
         model_base_dir="DeepFilterNet3",
-        atten_lim_db=0.0,
-        always_apply_all_stages=False,
         device="cpu",
     ):
         super().__init__()
@@ -786,7 +690,6 @@ class TorchDFPipeline(nn.Module):
             df_dec=model.df_dec,
             erb_dec=model.erb_dec,
             df_order=df_order,
-            always_apply_all_stages=always_apply_all_stages,
             conv_lookahead=conv_lookahead,
             nb_df=nb_df,
             sr=self.sample_rate,
@@ -795,8 +698,6 @@ class TorchDFPipeline(nn.Module):
         self.states = torch.zeros(
             self.torch_streaming_model.states_full_len, device=device
         )
-
-        self.atten_lim_db = torch.tensor(atten_lim_db, device=device)
 
     def forward(self, input_audio: Tensor, sample_rate: int) -> Tensor:
         """
@@ -835,7 +736,7 @@ class TorchDFPipeline(nn.Module):
 
         for input_frame in chunked_audio:
             (enhanced_audio_frame, self.states, lsnr) = self.torch_streaming_model(
-                input_frame, self.states, self.atten_lim_db
+                input_frame, self.states
             )
 
             output_frames.append(enhanced_audio_frame)
@@ -856,9 +757,7 @@ def main(args):
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
 
-    torch_df = TorchDFPipeline(
-        device=args.device, always_apply_all_stages=args.always_apply_all_stages
-    )
+    torch_df = TorchDFPipeline(device=args.device)
 
     # torchaudio normalize=True, fp32 return
     noisy_audio, sr = torchaudio.load(args.audio_path, channels_first=True)
@@ -888,6 +787,5 @@ if __name__ == "__main__":
         choices=["cuda", "cpu"],
         help="Device to run on",
     )
-    parser.add_argument("--always-apply-all-stages", action="store_true")
 
     main(parser.parse_args())
