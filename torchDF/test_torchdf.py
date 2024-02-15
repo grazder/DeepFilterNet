@@ -20,12 +20,11 @@ class TestTorchStreaming():
         self.model, self.rust_state, _ = init_df(config_allow_defaults=True, model_base_dir='DeepFilterNet3')
         self.model.eval()
 
-        self.torch_streaming_like_offline = TorchDFPipeline(always_apply_all_stages=True, device=DEVICE)
+        self.torch_streaming_like_offline = TorchDFPipeline(device=DEVICE)
 
-        pipeline_for_streaming = TorchDFPipeline(always_apply_all_stages=False, device=DEVICE)
+        pipeline_for_streaming = TorchDFPipeline(device=DEVICE)
         self.torch_streaming = pipeline_for_streaming.torch_streaming_model
         self.streaming_state = pipeline_for_streaming.states
-        self.atten_lim_db = pipeline_for_streaming.atten_lim_db
 
         self.torch_offline = TorchDF(copy.deepcopy(self.model))
         self.torch_offline = self.torch_offline.to(DEVICE)
@@ -67,7 +66,7 @@ class TestTorchStreaming():
         chunked_audio = torch.split(self.noisy_audio.squeeze(0), 480)
 
         for i, chunk in enumerate(chunked_audio):
-            onnx_output, self.streaming_state, _ = self.torch_streaming(chunk, self.streaming_state, self.atten_lim_db)
+            onnx_output, self.streaming_state, _ = self.torch_streaming(chunk, self.streaming_state)
             rust_output = torch.from_numpy(self.df_tract.process(chunk.unsqueeze(0).cpu().numpy()))
 
             assert torch.allclose(onnx_output.to(DEVICE), rust_output.to(DEVICE), atol=1e-3), f'process failed - {i} iteration'

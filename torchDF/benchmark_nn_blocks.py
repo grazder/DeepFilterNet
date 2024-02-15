@@ -96,43 +96,43 @@ def main():
         f"Median encoder iteration time: {t0.blocked_autorange(min_run_time=10).median * 1e3:6.2f} ms / {480 / 48000 * 1000} ms"
     )
 
-    # ERB Decoder
-    erb_decoder = ERBDecoderWrapper(
-        streaming_model.erb_dec,
-        True,
-        (emb, e3, e2, e1, e0, erb_dec_hidden),
-    )
+    # # ERB Decoder
+    # erb_decoder = ERBDecoderWrapper(
+    #     streaming_model.erb_dec,
+    #     True,
+    #     (emb, e3, e2, e1, e0, erb_dec_hidden),
+    # )
 
-    def run_erb_decoder():
-        _ = erb_decoder(emb, e3, e2, e1, e0, erb_dec_hidden)
+    # def run_erb_decoder():
+    #     _ = erb_decoder(emb, e3, e2, e1, e0, erb_dec_hidden)
 
-    t0 = benchmark.Timer(
-        stmt="run_erb_decoder()",
-        num_threads=1,
-        globals={"run_erb_decoder": run_erb_decoder},
-    )
-    print(
-        f"Median erb_decoder iteration time: {t0.blocked_autorange(min_run_time=10).median * 1e3:6.2f} ms / {480 / 48000 * 1000} ms"
-    )
+    # t0 = benchmark.Timer(
+    #     stmt="run_erb_decoder()",
+    #     num_threads=1,
+    #     globals={"run_erb_decoder": run_erb_decoder},
+    # )
+    # print(
+    #     f"Median erb_decoder iteration time: {t0.blocked_autorange(min_run_time=10).median * 1e3:6.2f} ms / {480 / 48000 * 1000} ms"
+    # )
 
-    # DF Decoder
-    erb_decoder = DFDecoderWrapper(
-        streaming_model.df_dec,
-        True,
-        (emb, new_rolling_c0_buf, df_dec_hidden),
-    )
+    # # DF Decoder
+    # erb_decoder = DFDecoderWrapper(
+    #     streaming_model.df_dec,
+    #     True,
+    #     (emb, new_rolling_c0_buf, df_dec_hidden),
+    # )
 
-    def run_df_decoder():
-        _ = erb_decoder(emb, new_rolling_c0_buf, df_dec_hidden)
+    # def run_df_decoder():
+    #     _ = erb_decoder(emb, new_rolling_c0_buf, df_dec_hidden)
 
-    t0 = benchmark.Timer(
-        stmt="run_df_decoder()",
-        num_threads=1,
-        globals={"run_df_decoder": run_df_decoder},
-    )
-    print(
-        f"Median df_decoder iteration time: {t0.blocked_autorange(min_run_time=10).median * 1e3:6.2f} ms / {480 / 48000 * 1000} ms"
-    )
+    # t0 = benchmark.Timer(
+    #     stmt="run_df_decoder()",
+    #     num_threads=1,
+    #     globals={"run_df_decoder": run_df_decoder},
+    # )
+    # print(
+    #     f"Median df_decoder iteration time: {t0.blocked_autorange(min_run_time=10).median * 1e3:6.2f} ms / {480 / 48000 * 1000} ms"
+    # )
 
 
 if __name__ == "__main__":

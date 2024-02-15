@@ -1,11 +1,18 @@
+import onnx
 import torch
 import onnxruntime as ort
 
+from onnxruntime.quantization import (
+    shape_inference,
+)
+
+onnx.helper.make_sequence_value_info = onnx.helper.make_tensor_sequence_value_info
+
 
 class EncoderWrapper:
-    def __init__(self, encoder, onnx=False, input_features_example=None):
+    def __init__(self, encoder, onnx_conver=False, input_features_example=None):
         self.encoder = encoder
-        self.onnx = onnx
+        self.onnx = onnx_conver
         self.input_names = [
             "new_rolling_erb_buf",
             "new_rolling_feat_spec_buf",
@@ -36,14 +43,23 @@ class EncoderWrapper:
                 opset_version=14,
             )
 
+            onnx.checker.check_model(onnx.load(model_path), full_check=True)
+
+            shape_inference.quant_pre_process(
+                model_path,
+                model_path,
+                skip_symbolic_shape=False,
+            )
+
             sess_options = ort.SessionOptions()
             sess_options.graph_optimization_level = (
-                ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+                ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+                # ort.GraphOptimizationLevel.ORT_DISABLE_ALL
             )
             sess_options.optimized_model_filepath = model_path
             sess_options.intra_op_num_threads = 1
             sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-            # sess_options.enable_profiling = True
+            sess_options.enable_profiling = True
 
             self.ort_session = ort.InferenceSession(
                 model_path, sess_options, providers=["CPUExecutionProvider"]
@@ -64,7 +80,7 @@ class EncoderWrapper:
                 self.output_names,
                 input_features_onnx,
             )
-            # self.ort_session.end_profiling()
+            self.ort_session.end_profiling()
             return out
 
         return self.encoder(new_rolling_erb_buf, new_rolling_feat_spec_buf, enc_hidden)

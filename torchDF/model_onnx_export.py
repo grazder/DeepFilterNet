@@ -278,7 +278,7 @@ def main(args):
     sess_options.optimized_model_filepath = args.output_path
     sess_options.intra_op_num_threads = 1
     sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    sess_options.enable_profiling = True
+    # sess_options.enable_profiling = True
 
     ort_session = ort.InferenceSession(
         args.output_path,
@@ -290,7 +290,7 @@ def main(args):
         OUTPUT_NAMES,
         input_features_onnx,
     )
-    ort_session.end_profiling()
+    # ort_session.end_profiling()
 
     print(
         f"InferenceSession successful! Output shapes: {[x.shape for x in onnx_outputs]}"
