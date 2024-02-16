@@ -15,7 +15,7 @@ from typing import Tuple, List
 from df import init_df
 
 from functools import partial
-from typing import Tuple
+from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -24,14 +24,56 @@ import torch.nn.functional as F
 from loguru import logger
 
 from df.config import Csv, DfParams, config
-from df.modules import (
-    Conv2dNormAct,
-    SqueezedGRU_S,
-)
+from df.modules import Conv2dNormAct, ConvTranspose2dNormAct
 
 from typing_extensions import Final
 from torch.nn.parameter import Parameter
 from torch.nn import init
+
+
+class SqueezedGRU_S(nn.Module):
+    input_size: Final[int]
+    hidden_size: Final[int]
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        output_size: Optional[int] = None,
+        num_layers: int = 1,
+        linear_groups: int = 8,
+        batch_first: bool = True,
+        gru_skip_op: Optional[Callable[..., torch.nn.Module]] = None,
+        linear_act_layer: Callable[..., torch.nn.Module] = nn.Identity,
+    ):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.linear_in = nn.Sequential(
+            GroupedLinearEinsum(
+                input_size, hidden_size, linear_groups, linear_act_layer()
+            ),
+        )
+        self.gru = nn.GRU(
+            hidden_size, hidden_size, num_layers=num_layers, batch_first=batch_first
+        )
+        self.gru_skip = gru_skip_op() if gru_skip_op is not None else None
+        if output_size is not None:
+            self.linear_out = nn.Sequential(
+                GroupedLinearEinsum(
+                    hidden_size, output_size, linear_groups, linear_act_layer()
+                ),
+            )
+        else:
+            self.linear_out = nn.Identity()
+
+    def forward(self, input: Tensor, h: Tensor) -> Tuple[Tensor, Tensor]:
+        x = self.linear_in(input)
+        x, h = self.gru(x, h)
+        x = self.linear_out(x)
+        if self.gru_skip is not None:
+            x = x + self.gru_skip(input)
+        return x, h
 
 
 class GroupedLinearEinsum(nn.Module):
@@ -39,7 +81,13 @@ class GroupedLinearEinsum(nn.Module):
     hidden_size: Final[int]
     groups: Final[int]
 
-    def __init__(self, input_size: int, hidden_size: int, groups: int = 1):
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        groups: int = 1,
+        activation=nn.Identity(),
+    ):
         super().__init__()
         # self.weight: Tensor
         self.input_size = input_size
@@ -60,6 +108,7 @@ class GroupedLinearEinsum(nn.Module):
             ),
         )
         self.reset_parameters()
+        self.activation = activation
 
     def reset_parameters(self):
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))  # type: ignore
@@ -67,6 +116,7 @@ class GroupedLinearEinsum(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = x.reshape(self.groups, 1, self.ws)
         x = torch.matmul(x, self.weight)
+        x = self.activation(x)
         return x.view(1, 1, -1)
 
     def __repr__(self):
@@ -200,9 +250,12 @@ class Encoder(nn.Module):
         self.emb_dim = p.emb_hidden_dim
         self.emb_out_dim = p.conv_ch * p.nb_erb // 4
         df_fc_emb = GroupedLinearEinsum(
-            p.conv_ch * p.nb_df // 2, self.emb_in_dim, groups=p.enc_lin_groups
+            p.conv_ch * p.nb_df // 2,
+            self.emb_in_dim,
+            groups=p.enc_lin_groups,
+            activation=nn.ReLU(inplace=True),
         )
-        self.df_fc_emb = nn.Sequential(df_fc_emb, nn.ReLU(inplace=True))
+        self.df_fc_emb = nn.Sequential(df_fc_emb)
         if p.enc_concat:
             self.emb_in_dim *= 2
             self.combine = Concat()
@@ -228,7 +281,7 @@ class Encoder(nn.Module):
             self.emb_dim,
             output_size=self.emb_out_dim,
             num_layers=1,
-            batch_first=True,
+            batch_first=False,
             gru_skip_op=skip_op,
             linear_groups=p.lin_groups,
             linear_act_layer=partial(nn.ReLU, inplace=True),
@@ -239,24 +292,167 @@ class Encoder(nn.Module):
 
     def forward(
         self, feat_erb: Tensor, feat_spec: Tensor, hidden: Tensor
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         # Encodes erb; erb should be in dB scale + normalized; Fe are number of erb bands.
         # erb: [B, 1, T, Fe]
         # spec: [B, 2, T, Fc]
         # b, _, t, _ = feat_erb.shape
+
+        # feat erb branch
         e0 = self.erb_conv0(feat_erb)  # [B, C, T, F]
         e1 = self.erb_conv1(e0)  # [B, C*2, T, F/2]
         e2 = self.erb_conv2(e1)  # [B, C*4, T, F/4]
         e3 = self.erb_conv3(e2)  # [B, C*4, T, F/4]
+        emb = e3.permute(0, 2, 3, 1).flatten(2, 3)  # [B, T, C * F]
+
+        # feat spec branch
         c0 = self.df_conv0(feat_spec)  # [B, C, T, Fc]
         c1 = self.df_conv1(c0)  # [B, C*2, T, Fc/2]
-        cemb = c1.permute(0, 2, 3, 1).flatten(2)  # [B, T, -1]
+        cemb = c1.permute(0, 2, 3, 1)  # [B, T, -1]
         cemb = self.df_fc_emb(cemb)  # [T, B, C * F/4]
-        emb = e3.permute(0, 2, 3, 1).flatten(2)  # [B, T, C * F]
+
+        # combine
         emb = self.combine(emb, cemb)
         emb, hidden = self.emb_gru(emb, hidden)  # [B, T, -1]
-        lsnr = self.lsnr_fc(emb) * self.lsnr_scale + self.lsnr_offset
-        return e0, e1, e2, e3, emb, c0, lsnr, hidden
+        return e0, e1, e2, e3, emb, c0, hidden
+
+
+class ErbDecoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        p = ModelParams()
+        assert p.nb_erb % 8 == 0, "erb_bins should be divisible by 8"
+
+        self.emb_in_dim = p.conv_ch * p.nb_erb // 4
+        self.emb_dim = p.emb_hidden_dim
+        self.emb_out_dim = p.conv_ch * p.nb_erb // 4
+
+        if p.emb_gru_skip == "none":
+            skip_op = None
+        elif p.emb_gru_skip == "identity":
+            assert self.emb_in_dim == self.emb_out_dim, "Dimensions do not match"
+            skip_op = partial(nn.Identity)
+        elif p.emb_gru_skip == "groupedlinear":
+            skip_op = partial(
+                GroupedLinearEinsum,
+                input_size=self.emb_in_dim,
+                hidden_size=self.emb_out_dim,
+                groups=p.lin_groups,
+            )
+        else:
+            raise NotImplementedError()
+        self.emb_gru = SqueezedGRU_S(
+            self.emb_in_dim,
+            self.emb_dim,
+            output_size=self.emb_out_dim,
+            num_layers=p.emb_num_layers - 1,
+            batch_first=False,
+            gru_skip_op=skip_op,
+            linear_groups=p.lin_groups,
+            linear_act_layer=partial(nn.ReLU, inplace=True),
+        )
+        tconv_layer = partial(
+            ConvTranspose2dNormAct,
+            kernel_size=p.convt_kernel,
+            bias=False,
+            separable=True,
+        )
+        conv_layer = partial(
+            Conv2dNormAct,
+            bias=False,
+            separable=True,
+        )
+        # convt: TransposedConvolution, convp: Pathway (encoder to decoder) convolutions
+        self.conv3p = conv_layer(p.conv_ch, p.conv_ch, kernel_size=1)
+        self.convt3 = conv_layer(p.conv_ch, p.conv_ch, kernel_size=p.conv_kernel)
+        self.conv2p = conv_layer(p.conv_ch, p.conv_ch, kernel_size=1)
+        self.convt2 = tconv_layer(p.conv_ch, p.conv_ch, fstride=2)
+        self.conv1p = conv_layer(p.conv_ch, p.conv_ch, kernel_size=1)
+        self.convt1 = tconv_layer(p.conv_ch, p.conv_ch, fstride=2)
+        self.conv0p = conv_layer(p.conv_ch, p.conv_ch, kernel_size=1)
+        self.conv0_out = conv_layer(
+            p.conv_ch, 1, kernel_size=p.conv_kernel, activation_layer=nn.Sigmoid
+        )
+
+    def forward(
+        self,
+        emb: Tensor,
+        e3: Tensor,
+        e2: Tensor,
+        e1: Tensor,
+        e0: Tensor,
+        hidden: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        # Estimates erb mask
+        b, _, t, f8 = e3.shape
+        emb, hidden = self.emb_gru(emb, hidden)
+        emb = emb.view(1, 1, f8, -1).permute(0, 3, 1, 2)  # [B, C*8, T, F/8]
+        e3 = self.convt3(self.conv3p(e3) + emb)  # [B, C*4, T, F/4]
+        e2 = self.convt2(self.conv2p(e2) + e3)  # [B, C*2, T, F/2]
+        e1 = self.convt1(self.conv1p(e1) + e2)  # [B, C, T, F]
+        m = self.conv0_out(self.conv0p(e0) + e1)  # [B, 1, T, F]
+        return m, hidden
+
+
+class DfDecoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        p = ModelParams()
+        layer_width = p.conv_ch
+
+        self.emb_in_dim = p.conv_ch * p.nb_erb // 4
+        self.emb_dim = p.df_hidden_dim
+
+        self.df_n_hidden = p.df_hidden_dim
+        self.df_n_layers = p.df_num_layers
+        self.df_order = p.df_order
+        self.df_bins = p.nb_df
+        self.df_out_ch = p.df_order * 2
+
+        conv_layer = partial(Conv2dNormAct, separable=True, bias=False)
+        kt = p.df_pathway_kernel_size_t
+        self.conv_buffer_size = kt - 1
+        self.df_convp = conv_layer(
+            layer_width, self.df_out_ch, fstride=1, kernel_size=(kt, 1)
+        )
+
+        self.df_gru = SqueezedGRU_S(
+            self.emb_in_dim,
+            self.emb_dim,
+            num_layers=self.df_n_layers,
+            batch_first=True,
+            gru_skip_op=None,
+            linear_act_layer=partial(nn.ReLU, inplace=True),
+        )
+        p.df_gru_skip = p.df_gru_skip.lower()
+        assert p.df_gru_skip in ("none", "identity", "groupedlinear")
+        self.df_skip: Optional[nn.Module]
+        if p.df_gru_skip == "none":
+            self.df_skip = None
+        elif p.df_gru_skip == "identity":
+            assert p.emb_hidden_dim == p.df_hidden_dim, "Dimensions do not match"
+            self.df_skip = nn.Identity()
+        elif p.df_gru_skip == "groupedlinear":
+            self.df_skip = GroupedLinearEinsum(
+                self.emb_in_dim, self.emb_dim, groups=p.lin_groups
+            )
+        else:
+            raise NotImplementedError()
+        self.df_out: nn.Module
+        out_dim = self.df_bins * self.df_out_ch
+        df_out = GroupedLinearEinsum(self.df_n_hidden, out_dim, groups=p.lin_groups)
+        self.df_out = nn.Sequential(df_out, nn.Tanh())
+        self.df_fc_a = nn.Sequential(nn.Linear(self.df_n_hidden, 1), nn.Sigmoid())
+
+    def forward(self, emb: Tensor, c0: Tensor, hidden: Tensor) -> Tuple[Tensor, Tensor]:
+        b, t, _ = emb.shape
+        c, hidden = self.df_gru(emb, hidden)  # [B, T, H], H: df_n_hidden
+        if self.df_skip is not None:
+            c = c + self.df_skip(emb)
+        c0 = self.df_convp(c0).permute(0, 2, 3, 1)  # [B, T, F, O*2], channels_last
+        c = self.df_out(c)  # [B, T, F*O*2], O: df_order
+        c = c.view(b, t, self.df_bins, self.df_out_ch) + c0  # [B, T, F, O*2]
+        return c, hidden
 
 
 class ExportableStreamingMinimalTorchDF(nn.Module):
@@ -363,10 +559,14 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         self.enc.df_conv0 = self.remove_conv_block_padding(self.enc.df_conv0)
 
         # Instead of padding we put tensor with buffers into df_decoder
-        self.df_dec = df_dec
+        self.df_dec = DfDecoder()
+        self.df_dec.load_state_dict(df_dec.state_dict())
+        self.df_dec.eval()
         self.df_dec.df_convp = self.remove_conv_block_padding(self.df_dec.df_convp)
 
-        self.erb_dec = erb_dec
+        self.erb_dec = ErbDecoder()
+        self.erb_dec.load_state_dict(erb_dec.state_dict())
+        self.erb_dec.eval()
         ### End Model
 
         self.alpha = alpha
@@ -859,11 +1059,9 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
             [rolling_feat_spec_buf[:, :, 1:, :], spec_feat], dim=2
         )
 
-        e0, e1, e2, e3, emb, c0, lsnr, new_enc_hidden = self.enc(
+        e0, e1, e2, e3, emb, c0, new_enc_hidden = self.enc(
             new_rolling_erb_buf, new_rolling_feat_spec_buf, enc_hidden
         )
-
-        lsnr = lsnr.flatten()  # [b=1, t=1, 1] -> 1
 
         # erb_dec
         # [BS=1, 1, T=1, ERB]
@@ -907,7 +1105,7 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         ]
         new_states = torch.cat([x.flatten() for x in new_states])
 
-        return enhanced_audio_frame, new_states, lsnr
+        return enhanced_audio_frame, new_states, torch.tensor(0)
 
 
 class TorchDFMinimalPipeline(nn.Module):
