@@ -909,8 +909,21 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         gain_spec[: self.nb_df] = torch.sum(mult, dim=0)
         return gain_spec
 
-    def unpack_states(
-        self, states: Tensor
+    def forward(
+        self,
+        input_frame: Tensor,
+        erb_norm_state: Tensor,
+        band_unit_norm_state: Tensor,
+        analysis_mem: Tensor,
+        synthesis_mem: Tensor,
+        rolling_erb_buf: Tensor,
+        rolling_feat_spec_buf: Tensor,
+        rolling_c0_buf: Tensor,
+        rolling_spec_buf_x: Tensor,
+        rolling_spec_buf_y: Tensor,
+        enc_hidden: Tensor,
+        erb_dec_hidden: Tensor,
+        df_dec_hidden: Tensor,
     ) -> Tuple[
         Tensor,
         Tensor,
@@ -924,108 +937,21 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         Tensor,
         Tensor,
         Tensor,
+        Tensor,
     ]:
-        splitted_states = torch.split(states, self.state_lens)
-
-        erb_norm_state = splitted_states[0].view(self.erb_norm_state_shape)
-        band_unit_norm_state = splitted_states[1].view(self.band_unit_norm_state_shape)
-        analysis_mem = splitted_states[2].view(self.analysis_mem_shape)
-        synthesis_mem = splitted_states[3].view(self.synthesis_mem_shape)
-        rolling_erb_buf = splitted_states[4].view(self.rolling_erb_buf_shape)
-        rolling_feat_spec_buf = splitted_states[5].view(
-            self.rolling_feat_spec_buf_shape
-        )
-        rolling_c0_buf = splitted_states[6].view(self.rolling_c0_buf_shape)
-        rolling_spec_buf_x = splitted_states[7].view(self.rolling_spec_buf_x_shape)
-        rolling_spec_buf_y = splitted_states[8].view(self.rolling_spec_buf_y_shape)
-        enc_hidden = splitted_states[9].view(self.enc_hidden_shape)
-        erb_dec_hidden = splitted_states[10].view(self.erb_dec_hidden_shape)
-        df_dec_hidden = splitted_states[11].view(self.df_dec_hidden_shape)
-
-        new_erb_norm_state = (
-            torch.linspace(
-                self.linspace_erb[0],
-                self.linspace_erb[1],
-                self.nb_bands,
-                device=erb_norm_state.device,
-            )
-            .view(self.erb_norm_state_shape)
-            .to(torch.float32)
-        )  # float() to fix export issue
-        new_band_unit_norm_state = (
-            torch.linspace(
-                self.linspace_df[0],
-                self.linspace_df[1],
-                self.nb_df,
-                device=band_unit_norm_state.device,
-            )
-            .view(self.band_unit_norm_state_shape)
-            .to(torch.float32)
-        )  # float() to fix export issue
-
-        erb_norm_state = torch.where(
-            torch.tensor(torch.nonzero(erb_norm_state).shape[0] == 0),
-            new_erb_norm_state,
-            erb_norm_state,
-        )
-
-        band_unit_norm_state = torch.where(
-            torch.tensor(torch.nonzero(band_unit_norm_state).shape[0] == 0),
-            new_band_unit_norm_state,
-            band_unit_norm_state,
-        )
-
-        return (
-            erb_norm_state,
-            band_unit_norm_state,
-            analysis_mem,
-            synthesis_mem,
-            rolling_erb_buf,
-            rolling_feat_spec_buf,
-            rolling_c0_buf,
-            rolling_spec_buf_x,
-            rolling_spec_buf_y,
-            enc_hidden,
-            erb_dec_hidden,
-            df_dec_hidden,
-        )
-
-    def forward(
-        self, input_frame: Tensor, states: Tensor
-    ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Enhancing input audio frame
 
         Parameters:
             input_frame:        Float[t] - Input raw audio frame
-            states:             Float[state_len] - Flattened and concated states
-            atten_lim_db:       Float[1] - Attenuation lim
 
         Returns:
             enhanced_frame:     Float[t] - Enhanced audio frame
-            new_states:         Float[state_len] - Flattened and concated updated states
-            lsnr:               Float[1] - Estimated lsnr of input frame
-
         """
         assert input_frame.ndim == 1, "only bs=1 and t=frame_size supported"
         assert (
             input_frame.shape[0] == self.frame_size
         ), "input_frame must be bs=1 and t=frame_size"
-
-        (
-            erb_norm_state,
-            band_unit_norm_state,
-            analysis_mem,
-            synthesis_mem,
-            rolling_erb_buf,
-            rolling_feat_spec_buf,
-            rolling_c0_buf,
-            rolling_spec_buf_x,
-            rolling_spec_buf_y,
-            enc_hidden,
-            erb_dec_hidden,
-            df_dec_hidden,
-        ) = self.unpack_states(states)
 
         spectrogram, new_analysis_mem = self.frame_analysis(input_frame, analysis_mem)
         spectrogram = spectrogram.unsqueeze(
@@ -1089,7 +1015,8 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
             current_spec, synthesis_mem
         )
 
-        new_states = [
+        return (
+            enhanced_audio_frame,
             new_erb_norm_state,
             new_band_unit_norm_state,
             new_analysis_mem,
@@ -1102,10 +1029,7 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
             new_enc_hidden,
             new_erb_dec_hidden,
             new_df_dec_hidden,
-        ]
-        new_states = torch.cat([x.flatten() for x in new_states])
-
-        return enhanced_audio_frame, new_states, torch.tensor(0)
+        )
 
 
 class TorchDFMinimalPipeline(nn.Module):
@@ -1144,9 +1068,61 @@ class TorchDFMinimalPipeline(nn.Module):
             sr=self.sample_rate,
         )
         self.torch_streaming_model = self.torch_streaming_model.to(device)
-        self.states = torch.zeros(
-            self.torch_streaming_model.states_full_len, device=device
+
+        erb_norm_state = torch.zeros(self.torch_streaming_model.erb_norm_state_shape)
+        band_unit_norm_state = torch.zeros(
+            self.torch_streaming_model.band_unit_norm_state_shape
         )
+        analysis_mem = torch.zeros(self.torch_streaming_model.analysis_mem_shape)
+        synthesis_mem = torch.zeros(self.torch_streaming_model.synthesis_mem_shape)
+        rolling_erb_buf = torch.zeros(self.torch_streaming_model.rolling_erb_buf_shape)
+        rolling_feat_spec_buf = torch.zeros(
+            self.torch_streaming_model.rolling_feat_spec_buf_shape
+        )
+        rolling_c0_buf = torch.zeros(self.torch_streaming_model.rolling_c0_buf_shape)
+        rolling_spec_buf_x = torch.zeros(
+            self.torch_streaming_model.rolling_spec_buf_x_shape
+        )
+        rolling_spec_buf_y = torch.zeros(
+            self.torch_streaming_model.rolling_spec_buf_y_shape
+        )
+        enc_hidden = torch.zeros(self.torch_streaming_model.enc_hidden_shape)
+        erb_dec_hidden = torch.zeros(self.torch_streaming_model.erb_dec_hidden_shape)
+        df_dec_hidden = torch.zeros(self.torch_streaming_model.df_dec_hidden_shape)
+
+        erb_norm_state = (
+            torch.linspace(
+                self.torch_streaming_model.linspace_erb[0],
+                self.torch_streaming_model.linspace_erb[1],
+                self.torch_streaming_model.nb_bands,
+            )
+            .view(self.torch_streaming_model.erb_norm_state_shape)
+            .to(torch.float32)
+        )  # float() to fix export issue
+        band_unit_norm_state = (
+            torch.linspace(
+                self.torch_streaming_model.linspace_df[0],
+                self.torch_streaming_model.linspace_df[1],
+                self.torch_streaming_model.nb_df,
+            )
+            .view(self.torch_streaming_model.band_unit_norm_state_shape)
+            .to(torch.float32)
+        )  # float() to fix export issue
+
+        self.states = [
+            erb_norm_state,
+            band_unit_norm_state,
+            analysis_mem,
+            synthesis_mem,
+            rolling_erb_buf,
+            rolling_feat_spec_buf,
+            rolling_c0_buf,
+            rolling_spec_buf_x,
+            rolling_spec_buf_y,
+            enc_hidden,
+            erb_dec_hidden,
+            df_dec_hidden,
+        ]
 
     def forward(self, input_audio: Tensor, sample_rate: int) -> Tensor:
         """
@@ -1184,8 +1160,8 @@ class TorchDFMinimalPipeline(nn.Module):
         output_frames = []
 
         for input_frame in chunked_audio:
-            (enhanced_audio_frame, self.states, lsnr) = self.torch_streaming_model(
-                input_frame, self.states
+            enhanced_audio_frame, *self.states = self.torch_streaming_model(
+                input_frame, *self.states
             )
 
             output_frames.append(enhanced_audio_frame)

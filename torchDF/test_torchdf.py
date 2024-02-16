@@ -125,9 +125,8 @@ class TestTorchStreaming:
             )
             (
                 minimal_output,
-                self.streaming_state_minimal,
-                _,
-            ) = self.torch_streaming_minimal(chunk, self.streaming_state_minimal)
+                *self.streaming_state_minimal,
+            ) = self.torch_streaming_minimal(chunk, *self.streaming_state_minimal)
 
             minimal_output = minimal_output.to(DEVICE)
             base_output = base_output.to(DEVICE)

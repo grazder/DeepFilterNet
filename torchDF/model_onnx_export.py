@@ -17,8 +17,36 @@ torch.manual_seed(0)
 
 FRAME_SIZE = 480
 OPSET_VERSION = 17
-INPUT_NAMES = ["input_frame", "states"]
-OUTPUT_NAMES = ["enhanced_audio_frame", "out_states", "lsnr"]
+INPUT_NAMES = [
+    "input_frame",
+    "erb_norm_state",
+    "band_unit_norm_state",
+    "analysis_mem",
+    "synthesis_mem",
+    "rolling_erb_buf",
+    "rolling_feat_spec_buf",
+    "rolling_c0_buf",
+    "rolling_spec_buf_x",
+    "rolling_spec_buf_y",
+    "enc_hidden",
+    "erb_dec_hidden",
+    "df_dec_hidden",
+]
+OUTPUT_NAMES = [
+    "enhanced_audio_frame",
+    "new_erb_norm_state",
+    "new_band_unit_norm_state",
+    "new_analysis_mem",
+    "new_synthesis_mem",
+    "new_rolling_erb_buf",
+    "new_rolling_feat_spec_buf",
+    "new_rolling_c0_buf",
+    "new_rolling_spec_buf_x",
+    "new_rolling_spec_buf_y",
+    "new_enc_hidden",
+    "new_erb_dec_hidden",
+    "new_df_dec_hidden",
+]
 
 
 def onnx_simplify(
@@ -193,7 +221,7 @@ def main(args):
     states = streaming_pipeline.states
 
     input_frame = torch.rand(FRAME_SIZE)
-    input_features = (input_frame, states)
+    input_features = (input_frame, *states)
     torch_df(*input_features)  # check model
 
     torch_df_script = torch.jit.script(torch_df)
@@ -273,7 +301,7 @@ def main(args):
 
     print("Checking model...")
     sess_options = ort.SessionOptions()
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
     sess_options.optimized_model_filepath = args.output_path
     sess_options.intra_op_num_threads = 1
     sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
