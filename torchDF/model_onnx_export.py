@@ -278,7 +278,7 @@ def main(args):
 
     # Simplify not working!
     if args.simplify:
-        raise NotImplementedError("Simplify not working for flatten states!")
+        # raise NotImplementedError("Simplify not working for flatten states!")
         onnx_simplify(args.output_path, input_features_onnx, input_shapes_dict)
         print(f"Model simplified! {args.output_path}")
 
@@ -301,7 +301,10 @@ def main(args):
 
     print("Checking model...")
     sess_options = ort.SessionOptions()
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+    # sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_options.graph_optimization_level = (
+        ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+    )
     sess_options.optimized_model_filepath = args.output_path
     sess_options.intra_op_num_threads = 1
     sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
