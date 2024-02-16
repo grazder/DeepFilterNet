@@ -1,4 +1,3 @@
-import os
 import copy
 import onnx
 import argparse
@@ -10,7 +9,7 @@ import numpy as np
 import onnxruntime as ort
 import torch.utils.benchmark as benchmark
 
-from torch_df_streaming import TorchDFPipeline
+from torch_df_streaming_minimal import TorchDFMinimalPipeline
 from typing import Dict, Iterable
 from torch.onnx._internal import jit_utils
 
@@ -189,7 +188,7 @@ def custom_identity(g: jit_utils.GraphContext, X):
 
 
 def main(args):
-    streaming_pipeline = TorchDFPipeline(device="cpu")
+    streaming_pipeline = TorchDFMinimalPipeline(device="cpu")
     torch_df = streaming_pipeline.torch_streaming_model
     states = streaming_pipeline.states
 

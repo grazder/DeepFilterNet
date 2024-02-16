@@ -10,12 +10,256 @@ from torch.nn import functional as F
 
 from torch import nn
 from torch import Tensor
-from typing import Tuple
+from typing import Tuple, List
 
 from df import init_df
 
+from functools import partial
+from typing import Tuple
 
-class ExportableStreamingTorchDF(nn.Module):
+import torch
+from torch import Tensor, nn
+import torch.nn.functional as F
+
+from loguru import logger
+
+from df.config import Csv, DfParams, config
+from df.modules import (
+    Conv2dNormAct,
+    SqueezedGRU_S,
+)
+
+from typing_extensions import Final
+from torch.nn.parameter import Parameter
+from torch.nn import init
+
+
+class GroupedLinearEinsum(nn.Module):
+    input_size: Final[int]
+    hidden_size: Final[int]
+    groups: Final[int]
+
+    def __init__(self, input_size: int, hidden_size: int, groups: int = 1):
+        super().__init__()
+        # self.weight: Tensor
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.groups = groups
+        assert (
+            input_size % groups == 0
+        ), f"Input size {input_size} not divisible by {groups}"
+        assert (
+            hidden_size % groups == 0
+        ), f"Hidden size {hidden_size} not divisible by {groups}"
+        self.ws = input_size // groups
+        self.register_parameter(
+            "weight",
+            Parameter(
+                torch.zeros(groups, input_size // groups, hidden_size // groups),
+                requires_grad=True,
+            ),
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))  # type: ignore
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x.reshape(self.groups, 1, self.ws)
+        x = torch.matmul(x, self.weight)
+        return x.view(1, 1, -1)
+
+    def __repr__(self):
+        cls = self.__class__.__name__
+        return f"{cls}(input_size: {self.input_size}, hidden_size: {self.hidden_size}, groups: {self.groups})"
+
+
+class ModelParams(DfParams):
+    section = "deepfilternet"
+
+    def __init__(self):
+        super().__init__()
+        self.conv_lookahead: int = config(
+            "CONV_LOOKAHEAD", cast=int, default=0, section=self.section
+        )
+        self.conv_ch: int = config(
+            "CONV_CH", cast=int, default=16, section=self.section
+        )
+        self.conv_depthwise: bool = config(
+            "CONV_DEPTHWISE", cast=bool, default=True, section=self.section
+        )
+        self.convt_depthwise: bool = config(
+            "CONVT_DEPTHWISE", cast=bool, default=True, section=self.section
+        )
+        self.conv_kernel: List[int] = config(
+            "CONV_KERNEL",
+            cast=Csv(int),
+            default=(1, 3),
+            section=self.section,  # type: ignore
+        )
+        self.convt_kernel: List[int] = config(
+            "CONVT_KERNEL",
+            cast=Csv(int),
+            default=(1, 3),
+            section=self.section,  # type: ignore
+        )
+        self.conv_kernel_inp: List[int] = config(
+            "CONV_KERNEL_INP",
+            cast=Csv(int),
+            default=(3, 3),
+            section=self.section,  # type: ignore
+        )
+        self.emb_hidden_dim: int = config(
+            "EMB_HIDDEN_DIM", cast=int, default=256, section=self.section
+        )
+        self.emb_num_layers: int = config(
+            "EMB_NUM_LAYERS", cast=int, default=2, section=self.section
+        )
+        self.emb_gru_skip_enc: str = config(
+            "EMB_GRU_SKIP_ENC", default="none", section=self.section
+        )
+        self.emb_gru_skip: str = config(
+            "EMB_GRU_SKIP", default="none", section=self.section
+        )
+        self.df_hidden_dim: int = config(
+            "DF_HIDDEN_DIM", cast=int, default=256, section=self.section
+        )
+        self.df_gru_skip: str = config(
+            "DF_GRU_SKIP", default="none", section=self.section
+        )
+        self.df_pathway_kernel_size_t: int = config(
+            "DF_PATHWAY_KERNEL_SIZE_T", cast=int, default=1, section=self.section
+        )
+        self.enc_concat: bool = config(
+            "ENC_CONCAT", cast=bool, default=False, section=self.section
+        )
+        self.df_num_layers: int = config(
+            "DF_NUM_LAYERS", cast=int, default=3, section=self.section
+        )
+        self.df_n_iter: int = config(
+            "DF_N_ITER", cast=int, default=1, section=self.section
+        )
+        self.lin_groups: int = config(
+            "LINEAR_GROUPS", cast=int, default=1, section=self.section
+        )
+        self.enc_lin_groups: int = config(
+            "ENC_LINEAR_GROUPS", cast=int, default=16, section=self.section
+        )
+        self.mask_pf: bool = config(
+            "MASK_PF", cast=bool, default=False, section=self.section
+        )
+        self.lsnr_dropout: bool = config(
+            "LSNR_DROPOUT", cast=bool, default=False, section=self.section
+        )
+
+
+class Add(nn.Module):
+    def forward(self, a, b):
+        return a + b
+
+
+class Concat(nn.Module):
+    def forward(self, a, b):
+        return torch.cat((a, b), dim=-1)
+
+
+class Encoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        p = ModelParams()
+        assert p.nb_erb % 4 == 0, "erb_bins should be divisible by 4"
+
+        self.erb_conv0 = Conv2dNormAct(
+            1, p.conv_ch, kernel_size=p.conv_kernel_inp, bias=False, separable=True
+        )
+        self.conv_buffer_size = p.conv_kernel_inp[0] - 1
+        self.conv_ch = p.conv_ch
+
+        conv_layer = partial(
+            Conv2dNormAct,
+            in_ch=p.conv_ch,
+            out_ch=p.conv_ch,
+            kernel_size=p.conv_kernel,
+            bias=False,
+            separable=True,
+        )
+        self.erb_conv1 = conv_layer(fstride=2)
+        self.erb_conv2 = conv_layer(fstride=2)
+        self.erb_conv3 = conv_layer(fstride=1)
+        self.df_conv0_ch = p.conv_ch
+        self.df_conv0 = Conv2dNormAct(
+            2,
+            self.df_conv0_ch,
+            kernel_size=p.conv_kernel_inp,
+            bias=False,
+            separable=True,
+        )
+        self.df_conv1 = conv_layer(fstride=2)
+        self.erb_bins = p.nb_erb
+        self.emb_in_dim = p.conv_ch * p.nb_erb // 4
+        self.emb_dim = p.emb_hidden_dim
+        self.emb_out_dim = p.conv_ch * p.nb_erb // 4
+        df_fc_emb = GroupedLinearEinsum(
+            p.conv_ch * p.nb_df // 2, self.emb_in_dim, groups=p.enc_lin_groups
+        )
+        self.df_fc_emb = nn.Sequential(df_fc_emb, nn.ReLU(inplace=True))
+        if p.enc_concat:
+            self.emb_in_dim *= 2
+            self.combine = Concat()
+        else:
+            self.combine = Add()
+        self.emb_n_layers = p.emb_num_layers
+        if p.emb_gru_skip_enc == "none":
+            skip_op = None
+        elif p.emb_gru_skip_enc == "identity":
+            assert self.emb_in_dim == self.emb_out_dim, "Dimensions do not match"
+            skip_op = partial(nn.Identity)
+        elif p.emb_gru_skip_enc == "groupedlinear":
+            skip_op = partial(
+                GroupedLinearEinsum,
+                input_size=self.emb_out_dim,
+                hidden_size=self.emb_out_dim,
+                groups=p.lin_groups,
+            )
+        else:
+            raise NotImplementedError()
+        self.emb_gru = SqueezedGRU_S(
+            self.emb_in_dim,
+            self.emb_dim,
+            output_size=self.emb_out_dim,
+            num_layers=1,
+            batch_first=True,
+            gru_skip_op=skip_op,
+            linear_groups=p.lin_groups,
+            linear_act_layer=partial(nn.ReLU, inplace=True),
+        )
+        self.lsnr_fc = nn.Sequential(nn.Linear(self.emb_out_dim, 1), nn.Sigmoid())
+        self.lsnr_scale = p.lsnr_max - p.lsnr_min
+        self.lsnr_offset = p.lsnr_min
+
+    def forward(
+        self, feat_erb: Tensor, feat_spec: Tensor, hidden: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        # Encodes erb; erb should be in dB scale + normalized; Fe are number of erb bands.
+        # erb: [B, 1, T, Fe]
+        # spec: [B, 2, T, Fc]
+        # b, _, t, _ = feat_erb.shape
+        e0 = self.erb_conv0(feat_erb)  # [B, C, T, F]
+        e1 = self.erb_conv1(e0)  # [B, C*2, T, F/2]
+        e2 = self.erb_conv2(e1)  # [B, C*4, T, F/4]
+        e3 = self.erb_conv3(e2)  # [B, C*4, T, F/4]
+        c0 = self.df_conv0(feat_spec)  # [B, C, T, Fc]
+        c1 = self.df_conv1(c0)  # [B, C*2, T, Fc/2]
+        cemb = c1.permute(0, 2, 3, 1).flatten(2)  # [B, T, -1]
+        cemb = self.df_fc_emb(cemb)  # [T, B, C * F/4]
+        emb = e3.permute(0, 2, 3, 1).flatten(2)  # [B, T, C * F]
+        emb = self.combine(emb, cemb)
+        emb, hidden = self.emb_gru(emb, hidden)  # [B, T, -1]
+        lsnr = self.lsnr_fc(emb) * self.lsnr_scale + self.lsnr_offset
+        return e0, e1, e2, e3, emb, c0, lsnr, hidden
+
+
+class ExportableStreamingMinimalTorchDF(nn.Module):
     def __init__(
         self,
         fft_size,
@@ -35,12 +279,11 @@ class ExportableStreamingTorchDF(nn.Module):
         normalize_atten_lim=20.0,
         silence_thresh=1e-7,
         sr=48000,
-        always_apply_all_stages=False,
     ):
         # All complex numbers are stored as floats for ONNX compatibility
         super().__init__()
 
-        self.fft_size = fft_size
+        self.fft_size = torch.tensor(fft_size, dtype=torch.float32)
         self.frame_size = hop_size  # dimension "f" in Float[f]
         self.window_size = fft_size
         self.window_size_h = fft_size // 2
@@ -48,14 +291,15 @@ class ExportableStreamingTorchDF(nn.Module):
         self.wnorm = 1.0 / (self.window_size**2 / (2 * self.frame_size))
         self.df_order = df_order
         self.lookahead = lookahead
-        self.always_apply_all_stages = torch.tensor(always_apply_all_stages)
         self.sr = sr
 
         # Initialize the vorbis window: sin(pi/2*sin^2(pi*n/N))
         window = torch.sin(
             0.5 * torch.pi * (torch.arange(self.fft_size) + 0.5) / self.window_size_h
         )
-        window = torch.sin(0.5 * torch.pi * window**2)
+        window = torch.sin(
+            0.5 * torch.pi * window**2,
+        )
         self.register_buffer("window", window)
 
         self.nb_df = nb_df
@@ -108,8 +352,11 @@ class ExportableStreamingTorchDF(nn.Module):
             self.erb_fb(self.erb_indices, normalized=True, inverse=True),
         )
 
-        # Model
-        self.enc = enc
+        ### Model
+        self.enc = Encoder()
+        self.enc.load_state_dict(enc.state_dict())
+        self.enc.eval()
+
         # Instead of padding we put tensor with buffers into encoder
         # I didn't checked receptived fields of convolution, but equallity tests are working
         self.enc.erb_conv0 = self.remove_conv_block_padding(self.enc.erb_conv0)
@@ -120,6 +367,8 @@ class ExportableStreamingTorchDF(nn.Module):
         self.df_dec.df_convp = self.remove_conv_block_padding(self.df_dec.df_convp)
 
         self.erb_dec = erb_dec
+        ### End Model
+
         self.alpha = alpha
 
         # RFFT
@@ -380,7 +629,8 @@ class ExportableStreamingTorchDF(nn.Module):
         # First part of the window on the previous frame
         # Second part of the window on the new input frame
         buf = torch.cat([analysis_mem, input_frame]) * self.window
-        rfft_buf = torch.matmul(buf, self.rfft_matrix) * self.wnorm
+        # rfft_buf = torch.matmul(buf, self.rfft_matrix) * self.wnorm
+        rfft_buf = torch.view_as_real(torch.fft.rfft(buf)) * self.wnorm
 
         # Copy input to analysis_mem for next iteration
         return rfft_buf, input_frame
@@ -409,66 +659,15 @@ class ExportableStreamingTorchDF(nn.Module):
             * self.fft_size
             * self.window
         )
+        # x = torch.fft.irfft(torch.view_as_complex(x)) * self.fft_size * self.window
 
         x_first, x_second = torch.split(
             x, [self.frame_size, self.window_size - self.frame_size]
         )
+
         output = x_first + synthesis_mem
 
-        return output, x_second
-
-    def is_apply_gains(self, lsnr: Tensor) -> Tensor:
-        """
-        Original code - libDF/src/tract.rs - is_apply_stages()
-        This code decomposed for better graph capturing
-
-        Parameters:
-            lsnr:   Tensor[Float] - predicted lsnr value
-
-        Returns:
-            output: Tensor[Bool] - whether to apply gains or not
-        """
-        if self.always_apply_all_stages:
-            return torch.ones_like(lsnr, dtype=torch.bool)
-
-        return torch.le(lsnr, self.max_db_erb_thresh) * torch.ge(
-            lsnr, self.min_db_thresh
-        )
-
-    def is_apply_gain_zeros(self, lsnr: Tensor) -> Tensor:
-        """
-        Original code - libDF/src/tract.rs - is_apply_stages()
-        This code decomposed for better graph capturing
-
-        Parameters:
-            lsnr:   Tensor[Float] - predicted lsnr value
-
-        Returns:
-            output: Tensor[Bool] - whether to apply gain_zeros or not
-        """
-        if self.always_apply_all_stages:
-            return torch.zeros_like(lsnr, dtype=torch.bool)
-
-        # Only noise detected, just apply a zero mask
-        return torch.ge(self.min_db_thresh, lsnr)
-
-    def is_apply_df(self, lsnr: Tensor) -> Tensor:
-        """
-        Original code - libDF/src/tract.rs - is_apply_stages()
-        This code decomposed for better graph capturing
-
-        Parameters:
-            lsnr:   Tensor[Float] - predicted lsnr value
-
-        Returns:
-            output: Tensor[Bool] - whether to apply deep filtering or not
-        """
-        if self.always_apply_all_stages:
-            return torch.ones_like(lsnr, dtype=torch.bool)
-
-        return torch.le(lsnr, self.max_db_df_thresh) * torch.ge(
-            lsnr, self.min_db_thresh
-        )
+        return output, x_second.view(self.window_size - self.frame_size)
 
     def apply_mask(self, spec: Tensor, gains: Tensor) -> Tensor:
         """
@@ -592,7 +791,7 @@ class ExportableStreamingTorchDF(nn.Module):
         )
 
     def forward(
-        self, input_frame: Tensor, states: Tensor, atten_lim_db: Tensor
+        self, input_frame: Tensor, states: Tensor
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Enhancing input audio frame
@@ -627,14 +826,6 @@ class ExportableStreamingTorchDF(nn.Module):
             erb_dec_hidden,
             df_dec_hidden,
         ) = self.unpack_states(states)
-
-        # If input_frame is silent, then do nothing and return zeros
-        rms_non_silence_condition = (
-            input_frame**2
-        ).sum() / self.frame_size >= self.silence_thresh
-        rms_non_silence_condition = torch.logical_or(
-            rms_non_silence_condition, self.always_apply_all_stages
-        )
 
         spectrogram, new_analysis_mem = self.frame_analysis(input_frame, analysis_mem)
         spectrogram = spectrogram.unsqueeze(
@@ -671,21 +862,15 @@ class ExportableStreamingTorchDF(nn.Module):
         e0, e1, e2, e3, emb, c0, lsnr, new_enc_hidden = self.enc(
             new_rolling_erb_buf, new_rolling_feat_spec_buf, enc_hidden
         )
-        lsnr = lsnr.flatten()  # [b=1, t=1, 1] -> 1
 
-        apply_gains = self.is_apply_gains(lsnr)
-        apply_df = self.is_apply_df(lsnr)
-        apply_gain_zeros = self.is_apply_gain_zeros(lsnr)
+        lsnr = lsnr.flatten()  # [b=1, t=1, 1] -> 1
 
         # erb_dec
         # [BS=1, 1, T=1, ERB]
         new_gains, new_erb_dec_hidden = self.erb_dec(
             emb, e3, e2, e1, e0, erb_dec_hidden
         )
-        gains = torch.where(apply_gains, new_gains.view(self.nb_bands), self.zero_gains)
-        new_erb_dec_hidden = torch.where(
-            apply_gains, new_erb_dec_hidden, erb_dec_hidden
-        )
+        gains = new_gains.view(self.nb_bands)
 
         # df_dec
         new_rolling_c0_buf = torch.cat([rolling_c0_buf[:, :, 1:, :], c0], dim=2)
@@ -693,35 +878,14 @@ class ExportableStreamingTorchDF(nn.Module):
         new_coefs, new_df_dec_hidden = self.df_dec(
             emb, new_rolling_c0_buf, df_dec_hidden
         )
-        new_rolling_c0_buf = torch.where(apply_df, new_rolling_c0_buf, rolling_c0_buf)
-        new_df_dec_hidden = torch.where(apply_df, new_df_dec_hidden, df_dec_hidden)
-        coefs = torch.where(
-            apply_df,
-            new_coefs.view(self.nb_df, -1, 2).permute(1, 0, 2),
-            self.zero_coefs,
-        )
+        coefs = new_coefs.view(self.nb_df, -1, 2).permute(1, 0, 2)
 
         # Applying features
         current_spec = new_rolling_spec_buf_y[self.df_order - 1]
-        current_spec = torch.where(
-            torch.logical_or(apply_gains, apply_gain_zeros),
-            self.apply_mask(current_spec.clone(), gains),
-            current_spec,
+        current_spec = self.apply_mask(current_spec.clone(), gains)
+        current_spec = self.deep_filter(
+            current_spec.clone(), coefs, new_rolling_spec_buf_x
         )
-        current_spec = torch.where(
-            apply_df,
-            self.deep_filter(current_spec.clone(), coefs, new_rolling_spec_buf_x),
-            current_spec,
-        )
-
-        # Mixing some noisy channel
-        # taken from https://github.com/Rikorose/DeepFilterNet/blob/59789e135cb5ed0eb86bb50e8f1be09f60859d5c/DeepFilterNet/df/enhance.py#L237
-        if torch.abs(atten_lim_db) > 0:
-            spec_noisy = rolling_spec_buf_x[
-                max(self.lookahead, self.df_order) - self.lookahead - 1
-            ]
-            lim = 10 ** (-torch.abs(atten_lim_db) / self.normalize_atten_lim)
-            current_spec = torch.lerp(current_spec, spec_noisy, lim)
 
         enhanced_audio_frame, new_synthesis_mem = self.frame_synthesis(
             current_spec, synthesis_mem
@@ -743,18 +907,10 @@ class ExportableStreamingTorchDF(nn.Module):
         ]
         new_states = torch.cat([x.flatten() for x in new_states])
 
-        # RMS conditioning for better ONNX graph
-        enhanced_audio_frame = torch.where(
-            rms_non_silence_condition,
-            enhanced_audio_frame,
-            torch.zeros_like(enhanced_audio_frame),
-        )
-        new_states = torch.where(rms_non_silence_condition, new_states, states)
-
         return enhanced_audio_frame, new_states, lsnr
 
 
-class TorchDFPipeline(nn.Module):
+class TorchDFMinimalPipeline(nn.Module):
     def __init__(
         self,
         nb_bands=32,
@@ -764,8 +920,6 @@ class TorchDFPipeline(nn.Module):
         conv_lookahead=2,
         nb_df=96,
         model_base_dir="DeepFilterNet3",
-        atten_lim_db=0.0,
-        always_apply_all_stages=False,
         device="cpu",
     ):
         super().__init__()
@@ -773,12 +927,13 @@ class TorchDFPipeline(nn.Module):
         self.fft_size = fft_size
 
         model, state, _ = init_df(
-            config_allow_defaults=True, model_base_dir=model_base_dir
+            config_allow_defaults=True,
+            model_base_dir=model_base_dir,
         )
         model.eval()
         self.sample_rate = state.sr()
 
-        self.torch_streaming_model = ExportableStreamingTorchDF(
+        self.torch_streaming_model = ExportableStreamingMinimalTorchDF(
             nb_bands=nb_bands,
             hop_size=hop_size,
             fft_size=fft_size,
@@ -786,7 +941,6 @@ class TorchDFPipeline(nn.Module):
             df_dec=model.df_dec,
             erb_dec=model.erb_dec,
             df_order=df_order,
-            always_apply_all_stages=always_apply_all_stages,
             conv_lookahead=conv_lookahead,
             nb_df=nb_df,
             sr=self.sample_rate,
@@ -795,8 +949,6 @@ class TorchDFPipeline(nn.Module):
         self.states = torch.zeros(
             self.torch_streaming_model.states_full_len, device=device
         )
-
-        self.atten_lim_db = torch.tensor(atten_lim_db, device=device)
 
     def forward(self, input_audio: Tensor, sample_rate: int) -> Tensor:
         """
@@ -835,7 +987,7 @@ class TorchDFPipeline(nn.Module):
 
         for input_frame in chunked_audio:
             (enhanced_audio_frame, self.states, lsnr) = self.torch_streaming_model(
-                input_frame, self.states, self.atten_lim_db
+                input_frame, self.states
             )
 
             output_frames.append(enhanced_audio_frame)
@@ -856,9 +1008,7 @@ def main(args):
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
 
-    torch_df = TorchDFPipeline(
-        device=args.device, always_apply_all_stages=args.always_apply_all_stages
-    )
+    torch_df = TorchDFMinimalPipeline(device=args.device)
 
     # torchaudio normalize=True, fp32 return
     noisy_audio, sr = torchaudio.load(args.audio_path, channels_first=True)
@@ -888,6 +1038,5 @@ if __name__ == "__main__":
         choices=["cuda", "cpu"],
         help="Device to run on",
     )
-    parser.add_argument("--always-apply-all-stages", action="store_true")
 
     main(parser.parse_args())

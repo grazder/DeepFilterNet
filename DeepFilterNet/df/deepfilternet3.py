@@ -159,14 +159,10 @@ class Encoder(nn.Module):
         self.emb_in_dim = p.conv_ch * p.nb_erb // 4
         self.emb_dim = p.emb_hidden_dim
         self.emb_out_dim = p.conv_ch * p.nb_erb // 4
-        self.df_fc_emb = nn.Sequential(
-            GroupedLinearEinsum(
-                p.conv_ch * p.nb_df // 2,
-                self.emb_in_dim,
-                groups=p.enc_lin_groups,
-            ),
-            nn.ReLU(inplace=True),
+        df_fc_emb = GroupedLinearEinsum(
+            p.conv_ch * p.nb_df // 2, self.emb_in_dim, groups=p.enc_lin_groups
         )
+        self.df_fc_emb = nn.Sequential(df_fc_emb, nn.ReLU(inplace=True))
         if p.enc_concat:
             self.emb_in_dim *= 2
             self.combine = Concat()
@@ -215,10 +211,8 @@ class Encoder(nn.Module):
         c0 = self.df_conv0(feat_spec)  # [B, C, T, Fc]
         c1 = self.df_conv1(c0)  # [B, C*2, T, Fc/2]
         cemb = c1.permute(0, 2, 3, 1).flatten(2)  # [B, T, -1]
-        cemb = self.df_fc_emb(cemb)
-        # cemb = self.df_fc_emb(c1)  # [T, B, C * F/4]
-        emb = e3.permute(0, 2, 3, 1).flatten(2)
-        # emb = e3.reshape(1, 1, -1)  # [B, T, C * F]
+        cemb = self.df_fc_emb(cemb)  # [T, B, C * F/4]
+        emb = e3.permute(0, 2, 3, 1).flatten(2)  # [B, T, C * F]
         emb = self.combine(emb, cemb)
         emb, hidden = self.emb_gru(emb, hidden)  # [B, T, -1]
         lsnr = self.lsnr_fc(emb) * self.lsnr_scale + self.lsnr_offset

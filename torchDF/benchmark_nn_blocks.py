@@ -4,7 +4,7 @@ import torch.utils.benchmark as benchmark
 
 from torch.nn import functional as F
 
-from torch_df_streaming import TorchDFPipeline
+from torch_df_streaming_minimal import TorchDFMinimalPipeline
 from nn_blocks import EncoderWrapper, ERBDecoderWrapper, DFDecoderWrapper
 
 DEVICE = "cpu"
@@ -38,7 +38,7 @@ def main():
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
 
-    torch_df = TorchDFPipeline(device=DEVICE)
+    torch_df = TorchDFMinimalPipeline(device=DEVICE)
     frame, states = generate_example_inputs(torch_df)
 
     streaming_model = torch_df.torch_streaming_model
