@@ -13,6 +13,9 @@ from torch_df_streaming_minimal import TorchDFMinimalPipeline
 from typing import Dict, Iterable
 from torch.onnx._internal import jit_utils
 
+# from onnxruntime_extensions import get_library_path as _lib_path
+
+
 torch.manual_seed(0)
 
 FRAME_SIZE = 480
@@ -196,7 +199,7 @@ def custom_irfft(g: jit_utils.GraphContext, X: torch.Value, n, dim, norm):
         g.op("Constant", value_t=torch.tensor([0], dtype=torch.int64)),
     )
     x = g.op(
-        "com.microsoft::Irfft",
+        "ai.onnx.contrib::Irfft",
         X,
         normalized_i=0,
         onesided_i=1,
@@ -224,7 +227,7 @@ def main(args):
     input_features = (input_frame, *states)
     torch_df(*input_features)  # check model
 
-    torch_df_script = torch.jit.script(torch_df)
+    # torch_df_script = torch.jit.script(torch_df)
 
     # ####
     # ten = torch.randn(481, 2, dtype=torch.float32)
@@ -243,17 +246,18 @@ def main(args):
         symbolic_fn=custom_rfft,
         opset_version=OPSET_VERSION,
     )
-    # torch.onnx.register_custom_op_symbolic(
-    #     symbolic_name="aten::fft_irfft",
-    #     symbolic_fn=custom_irfft,
-    #     opset_version=OPSET_VERSION,
-    # )
     # Only used with aten::fft_rfft, so it's useless in ONNX
     torch.onnx.register_custom_op_symbolic(
         symbolic_name="aten::view_as_real",
         symbolic_fn=custom_identity,
         opset_version=OPSET_VERSION,
     )
+
+    # torch.onnx.register_custom_op_symbolic(
+    #     symbolic_name="aten::fft_irfft",
+    #     symbolic_fn=custom_irfft,
+    #     opset_version=OPSET_VERSION,
+    # )
     # # Only used with aten::fft_irfft, so it's useless in ONNX
     # torch.onnx.register_custom_op_symbolic(
     #     symbolic_name="aten::view_as_complex",
@@ -262,14 +266,13 @@ def main(args):
     # )
 
     torch.onnx.export(
-        torch_df_script,
+        torch_df,
         input_features,
         args.output_path,
         verbose=False,
         input_names=INPUT_NAMES,
         output_names=OUTPUT_NAMES,
         opset_version=OPSET_VERSION,
-        operator_export_type=torch.onnx.OperatorExportTypes.ONNX,
     )
     print(f"Model exported to {args.output_path}!")
 
@@ -302,6 +305,7 @@ def main(args):
     print("Checking model...")
     sess_options = ort.SessionOptions()
     # sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    # sess_options.register_custom_ops_library(_lib_path())
     sess_options.graph_optimization_level = (
         ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
     )
@@ -316,10 +320,12 @@ def main(args):
         providers=["CPUExecutionProvider"],
     )
 
-    onnx_outputs = ort_session.run(
-        OUTPUT_NAMES,
-        input_features_onnx,
-    )
+    for _ in range(3):
+        onnx_outputs = ort_session.run(
+            OUTPUT_NAMES,
+            input_features_onnx,
+        )
+
     # ort_session.end_profiling()
 
     print(

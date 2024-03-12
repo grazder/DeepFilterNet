@@ -59,10 +59,10 @@ class EncoderDataReader(CalibrationDataReader):
             enc_hidden,
             erb_dec_hidden,
             df_dec_hidden,
-        ) = streaming_model.unpack_states(states)
+        ) = states
 
         for frame in chunked_audio[:n_samples]:
-            _, new_states, _ = streaming_model(frame, states)
+            new_states = streaming_model(frame, *states)[1:]
             (
                 new_erb_norm_state,
                 new_band_unit_norm_state,
@@ -76,7 +76,7 @@ class EncoderDataReader(CalibrationDataReader):
                 new_enc_hidden,
                 new_erb_dec_hidden,
                 new_df_dec_hidden,
-            ) = streaming_model.unpack_states(new_states)
+            ) = new_states
 
             # e0, e1, e2, e3, emb, c0, _ = streaming_model.enc(
             #     new_rolling_erb_buf, new_rolling_feat_spec_buf, enc_hidden
@@ -155,7 +155,7 @@ class EncoderWrapper:
             #     quant_format=QuantFormat.QDQ,
             #     per_channel=False,
             #     weight_type=QuantType.QInt8,
-            #     op_types_to_quantize=["MatMul"],
+            #     # op_types_to_quantize=["MatMul"],
             # )
 
             sess_options = ort.SessionOptions()

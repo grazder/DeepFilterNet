@@ -1,6 +1,7 @@
 """
 ONNX exportable classes
 """
+
 import math
 import torch
 import argparse
@@ -862,6 +863,12 @@ def main(args):
 
     # torchaudio normalize=True, fp32 return
     noisy_audio, sr = torchaudio.load(args.audio_path, channels_first=True)
+    if sr != torch_df.sample_rate:
+        resample = torchaudio.transforms.Resample(
+            orig_freq=sr, new_freq=torch_df.sample_rate
+        )
+        noisy_audio = resample(noisy_audio)
+        sr = torch_df.sample_rate
     noisy_audio = noisy_audio.mean(dim=0).unsqueeze(0).to(args.device)  # stereo to mono
 
     enhanced_audio = torch_df(noisy_audio, sr).detach().cpu()

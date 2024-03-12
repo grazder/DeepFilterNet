@@ -55,9 +55,9 @@ def main():
         enc_hidden,
         erb_dec_hidden,
         df_dec_hidden,
-    ) = streaming_model.unpack_states(states)
+    ) = states
 
-    _, new_states, _ = streaming_model(frame, states)
+    new_states = streaming_model(frame, *states)[1:]
     (
         new_erb_norm_state,
         new_band_unit_norm_state,
@@ -71,49 +71,49 @@ def main():
         new_enc_hidden,
         new_erb_dec_hidden,
         new_df_dec_hidden,
-    ) = streaming_model.unpack_states(new_states)
+    ) = new_states
 
     e0, e1, e2, e3, emb, c0, _ = streaming_model.enc(
         new_rolling_erb_buf, new_rolling_feat_spec_buf, enc_hidden
     )
 
     # Encoder
-    # encoder = EncoderWrapper(
-    #     streaming_model.enc,
-    #     True,
-    #     (new_rolling_erb_buf, new_rolling_feat_spec_buf, enc_hidden),
-    # )
-
-    # def run_encoder():
-    #     _ = encoder(new_rolling_erb_buf, new_rolling_feat_spec_buf, enc_hidden)
-
-    # t0 = benchmark.Timer(
-    #     stmt="run_encoder()",
-    #     num_threads=1,
-    #     globals={"run_encoder": run_encoder},
-    # )
-    # print(
-    #     f"Median encoder iteration time: {t0.blocked_autorange(min_run_time=10).median * 1e3:6.2f} ms / {480 / 48000 * 1000} ms"
-    # )
-
-    # ERB Decoder
-    erb_decoder = ERBDecoderWrapper(
-        streaming_model.erb_dec,
+    encoder = EncoderWrapper(
+        streaming_model.enc,
         True,
-        (emb, e3, e2, e1, e0, erb_dec_hidden),
+        (new_rolling_erb_buf, new_rolling_feat_spec_buf, enc_hidden),
     )
 
-    def run_erb_decoder():
-        _ = erb_decoder(emb, e3, e2, e1, e0, erb_dec_hidden)
+    def run_encoder():
+        _ = encoder(new_rolling_erb_buf, new_rolling_feat_spec_buf, enc_hidden)
 
     t0 = benchmark.Timer(
-        stmt="run_erb_decoder()",
+        stmt="run_encoder()",
         num_threads=1,
-        globals={"run_erb_decoder": run_erb_decoder},
+        globals={"run_encoder": run_encoder},
     )
     print(
-        f"Median erb_decoder iteration time: {t0.blocked_autorange(min_run_time=10).median * 1e3:6.2f} ms / {480 / 48000 * 1000} ms"
+        f"Median encoder iteration time: {t0.blocked_autorange(min_run_time=10).median * 1e3:6.2f} ms / {480 / 48000 * 1000} ms"
     )
+
+    # # ERB Decoder
+    # erb_decoder = ERBDecoderWrapper(
+    #     streaming_model.erb_dec,
+    #     True,
+    #     (emb, e3, e2, e1, e0, erb_dec_hidden),
+    # )
+
+    # def run_erb_decoder():
+    #     _ = erb_decoder(emb, e3, e2, e1, e0, erb_dec_hidden)
+
+    # t0 = benchmark.Timer(
+    #     stmt="run_erb_decoder()",
+    #     num_threads=1,
+    #     globals={"run_erb_decoder": run_erb_decoder},
+    # )
+    # print(
+    #     f"Median erb_decoder iteration time: {t0.blocked_autorange(min_run_time=10).median * 1e3:6.2f} ms / {480 / 48000 * 1000} ms"
+    # )
 
     # # DF Decoder
     # erb_decoder = DFDecoderWrapper(

@@ -1,6 +1,7 @@
 """
 ONNX exportable classes
 """
+
 import math
 import torch
 import argparse
@@ -29,6 +30,26 @@ from df.modules import Conv2dNormAct, ConvTranspose2dNormAct
 from typing_extensions import Final
 from torch.nn.parameter import Parameter
 from torch.nn import init
+
+
+from torch.autograd import Function
+
+
+class OnnxComplexMul(Function):
+    """Auto-grad function to mimic irfft for ONNX exporting"""
+
+    @staticmethod
+    def forward(ctx, input_0: torch.Tensor, input_1: torch.Tensor) -> torch.Tensor:
+        return torch.view_as_real(
+            torch.view_as_complex(input_0) * torch.view_as_complex(input_1)
+        )
+
+    @staticmethod
+    def symbolic(
+        g: torch.Graph, input_0: torch.Value, input_1: torch.Value
+    ) -> torch.Value:
+        """Symbolic representation for onnx graph"""
+        return g.op("ai.onnx.contrib::ComplexMul", input_0, input_1)
 
 
 class SqueezedGRU_S(nn.Module):
@@ -440,8 +461,10 @@ class DfDecoder(nn.Module):
             raise NotImplementedError()
         self.df_out: nn.Module
         out_dim = self.df_bins * self.df_out_ch
-        df_out = GroupedLinearEinsum(self.df_n_hidden, out_dim, groups=p.lin_groups)
-        self.df_out = nn.Sequential(df_out, nn.Tanh())
+        df_out = GroupedLinearEinsum(
+            self.df_n_hidden, out_dim, groups=p.lin_groups, activation=nn.Tanh()
+        )
+        self.df_out = nn.Sequential(df_out)
         self.df_fc_a = nn.Sequential(nn.Linear(self.df_n_hidden, 1), nn.Sigmoid())
 
     def forward(self, emb: Tensor, c0: Tensor, hidden: Tensor) -> Tuple[Tensor, Tensor]:
@@ -735,6 +758,7 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         Returns:
             output:     Float[F, 2] - final multiplication of two complex numbers
         """
+        # if not torch.onnx.is_in_onnx_export():
         t1_real = t1[..., 0]
         t1_imag = t1[..., 1]
         t2_real = t2[..., 0]
@@ -746,6 +770,8 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
             ),
             dim=-1,
         )
+        # return t1 * t2
+        # return OnnxComplexMul.apply(t1, t2)
 
     def erb(self, input_data: Tensor, erb_eps: float = 1e-10) -> Tensor:
         """
@@ -783,7 +809,7 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
             output:         Float[ERB] - normalized erb features
             erb_norm_state: Float[ERB] - updated normalization state
         """
-        new_erb_norm_state = torch.lerp(xs, erb_norm_state, alpha)
+        new_erb_norm_state = xs * (1 - alpha) + erb_norm_state * alpha
         output = (xs - new_erb_norm_state) / denominator
 
         return output, new_erb_norm_state
@@ -805,8 +831,8 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
             output:                 Float[1, DF] - normalized deep filtering features
             band_unit_norm_state:   Float[1, DF, 1] - updated normalization state
         """
-        xs_abs = torch.linalg.norm(xs, dim=-1, keepdim=True)  # xs.abs() from complex
-        new_band_unit_norm_state = torch.lerp(xs_abs, band_unit_norm_state, alpha)
+        xs_abs = torch.linalg.norm(xs, dim=-1, keepdim=True)  # xs.abs() from complexxs
+        new_band_unit_norm_state = xs_abs * (1 - alpha) + band_unit_norm_state * alpha
         output = xs / new_band_unit_norm_state.sqrt()
 
         return output, new_band_unit_norm_state
@@ -859,6 +885,7 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
             * self.fft_size
             * self.window
         )
+        # x = torch.cat([x[:, 0], torch.zeros(479)])
         # x = torch.fft.irfft(torch.view_as_complex(x)) * self.fft_size * self.window
 
         x_first, x_second = torch.split(
