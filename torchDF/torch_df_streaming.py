@@ -793,11 +793,14 @@ class TorchDFPipeline(nn.Module):
             sr=self.sample_rate,
         )
         self.torch_streaming_model = self.torch_streaming_model.to(device)
-        self.states = torch.zeros(
-            self.torch_streaming_model.states_full_len, device=device
-        )
-
         self.atten_lim_db = torch.tensor(atten_lim_db, device=device)
+        self.states = [
+            torch.zeros(self.torch_streaming_model.states_full_len, device=device),
+            self.atten_lim_db,
+        ]
+
+        self.input_names = ["input_frame", "states", "atten_lim_db"]
+        self.output_names = ["enhanced_audio_frame", "new_states", "lsnr"]
 
     def forward(self, input_audio: Tensor, sample_rate: int) -> Tensor:
         """
@@ -835,9 +838,10 @@ class TorchDFPipeline(nn.Module):
         output_frames = []
 
         for input_frame in chunked_audio:
-            (enhanced_audio_frame, self.states, lsnr) = self.torch_streaming_model(
-                input_frame, self.states, self.atten_lim_db
+            enhanced_audio_frame, states, _ = self.torch_streaming_model(
+                input_frame, *self.states
             )
+            self.states = [states, self.atten_lim_db]
 
             output_frames.append(enhanced_audio_frame)
 

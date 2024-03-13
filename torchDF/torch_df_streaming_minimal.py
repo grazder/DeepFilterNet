@@ -1150,6 +1150,36 @@ class TorchDFMinimalPipeline(nn.Module):
             erb_dec_hidden,
             df_dec_hidden,
         ]
+        self.input_names = [
+            "input_frame",
+            "erb_norm_state",
+            "band_unit_norm_state",
+            "analysis_mem",
+            "synthesis_mem",
+            "rolling_erb_buf",
+            "rolling_feat_spec_buf",
+            "rolling_c0_buf",
+            "rolling_spec_buf_x",
+            "rolling_spec_buf_y",
+            "enc_hidden",
+            "erb_dec_hidden",
+            "df_dec_hidden",
+        ]
+        self.output_names = [
+            "enhanced_audio_frame",
+            "new_erb_norm_state",
+            "new_band_unit_norm_state",
+            "new_analysis_mem",
+            "new_synthesis_mem",
+            "new_rolling_erb_buf",
+            "new_rolling_feat_spec_buf",
+            "new_rolling_c0_buf",
+            "new_rolling_spec_buf_x",
+            "new_rolling_spec_buf_y",
+            "new_enc_hidden",
+            "new_erb_dec_hidden",
+            "new_df_dec_hidden",
+        ]
 
     def forward(self, input_audio: Tensor, sample_rate: int) -> Tensor:
         """
