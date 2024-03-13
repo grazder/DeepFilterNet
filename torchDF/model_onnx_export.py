@@ -12,9 +12,7 @@ import torch.utils.benchmark as benchmark
 from torch_df_streaming_minimal import TorchDFMinimalPipeline
 from typing import Dict, Iterable
 from torch.onnx._internal import jit_utils
-
-# from onnxruntime_extensions import get_library_path as _lib_path
-
+from loguru import logger
 
 torch.manual_seed(0)
 
@@ -96,12 +94,12 @@ def test_onnx_model(torch_model, ort_session, states):
         input_frame = torch.randn(FRAME_SIZE)
 
         # torch
-        output_torch = torch_model(input_frame, states_torch)
+        output_torch = torch_model(input_frame, *states_torch)
 
         # onnx
         output_onnx = ort_session.run(
             OUTPUT_NAMES,
-            generate_onnx_features([input_frame, states_onnx]),
+            generate_onnx_features([input_frame, *states_onnx]),
         )
 
         for x, y, name in zip(output_torch, output_onnx, OUTPUT_NAMES):
@@ -138,7 +136,7 @@ def perform_benchmark(
         num_threads=1,
         globals={"run_onnx": run_onnx},
     )
-    print(
+    logger.info(
         f"Median iteration time: {t0.blocked_autorange(min_run_time=10).median * 1e3:6.2f} ms / {480 / 48000 * 1000} ms"
     )
 
@@ -192,27 +190,6 @@ def custom_rfft(g: jit_utils.GraphContext, X, n, dim, norm):
     return x
 
 
-def custom_irfft(g: jit_utils.GraphContext, X: torch.Value, n, dim, norm):
-    x = g.op(
-        "Unsqueeze",
-        X,
-        g.op("Constant", value_t=torch.tensor([0], dtype=torch.int64)),
-    )
-    x = g.op(
-        "ai.onnx.contrib::Irfft",
-        X,
-        normalized_i=0,
-        onesided_i=1,
-        signal_ndim_i=1,
-    )
-    x = g.op(
-        "Squeeze",
-        x,
-        g.op("Constant", value_t=torch.tensor([0], dtype=torch.int64)),
-    )
-    return x
-
-
 # setType API provides shape/type to ONNX shape/type inference
 def custom_identity(g: jit_utils.GraphContext, X):
     return X
@@ -227,20 +204,6 @@ def main(args):
     input_features = (input_frame, *states)
     torch_df(*input_features)  # check model
 
-    # torch_df_script = torch.jit.script(torch_df)
-
-    # ####
-    # ten = torch.randn(481, 2, dtype=torch.float32)
-    # out_onnx = Irfft(ten.numpy())
-    # out_torch = torch.fft.irfft(torch.view_as_complex(ten))
-
-    # print(out_onnx.shape, out_torch.shape)
-
-    # print(out_onnx[:5])
-    # print(out_torch[:5])
-    # # print(out_onnx[-5:])
-    # raise Exception()
-
     torch.onnx.register_custom_op_symbolic(
         symbolic_name="aten::fft_rfft",
         symbolic_fn=custom_rfft,
@@ -253,20 +216,10 @@ def main(args):
         opset_version=OPSET_VERSION,
     )
 
-    # torch.onnx.register_custom_op_symbolic(
-    #     symbolic_name="aten::fft_irfft",
-    #     symbolic_fn=custom_irfft,
-    #     opset_version=OPSET_VERSION,
-    # )
-    # # Only used with aten::fft_irfft, so it's useless in ONNX
-    # torch.onnx.register_custom_op_symbolic(
-    #     symbolic_name="aten::view_as_complex",
-    #     symbolic_fn=custom_identity,
-    #     opset_version=OPSET_VERSION,
-    # )
+    torch_df_script = torch.jit.script(torch_df)
 
     torch.onnx.export(
-        torch_df,
+        torch_df_script,
         input_features,
         args.output_path,
         verbose=False,
@@ -274,7 +227,7 @@ def main(args):
         output_names=OUTPUT_NAMES,
         opset_version=OPSET_VERSION,
     )
-    print(f"Model exported to {args.output_path}!")
+    logger.info(f"Model exported to {args.output_path}!")
 
     input_features_onnx = generate_onnx_features(input_features)
     input_shapes_dict = {x: y.shape for x, y in input_features_onnx.items()}
@@ -283,7 +236,7 @@ def main(args):
     if args.simplify:
         # raise NotImplementedError("Simplify not working for flatten states!")
         onnx_simplify(args.output_path, input_features_onnx, input_shapes_dict)
-        print(f"Model simplified! {args.output_path}")
+        logger.info(f"Model simplified! {args.output_path}")
 
     if args.ort:
         if (
@@ -300,19 +253,18 @@ def main(args):
             != 0
         ):
             raise RuntimeError("ONNX to ORT conversion failed!")
-        print("Model converted to ORT format!")
+        logger.info("Model converted to ORT format!")
 
-    print("Checking model...")
+    logger.info("Checking model...")
     sess_options = ort.SessionOptions()
-    # sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    # sess_options.register_custom_ops_library(_lib_path())
     sess_options.graph_optimization_level = (
         ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
     )
     sess_options.optimized_model_filepath = args.output_path
     sess_options.intra_op_num_threads = 1
+    sess_options.inter_op_num_threads = 1
     sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    # sess_options.enable_profiling = True
+    sess_options.enable_profiling = args.profiling
 
     ort_session = ort.InferenceSession(
         args.output_path,
@@ -326,23 +278,26 @@ def main(args):
             input_features_onnx,
         )
 
-    # ort_session.end_profiling()
+    if args.profiling:
+        logger.info("Profiling enabled...")
+        ort_session.end_profiling()
 
-    print(
+    logger.info(
         f"InferenceSession successful! Output shapes: {[x.shape for x in onnx_outputs]}"
     )
 
     if args.test:
-        test_onnx_model(torch_df, ort_session, input_features[1])
-        print("Tests passed!")
+        logger.info("Testing...")
+        test_onnx_model(torch_df, ort_session, input_features[1:])
+        logger.info("Tests passed!")
 
     if args.performance:
-        print("Performanse check...")
+        logger.info("Performanse check...")
         perform_benchmark(ort_session, input_features_onnx)
 
     if args.inference_path:
         infer_onnx_model(streaming_pipeline, ort_session, args.inference_path)
-        print(f"Audio from {args.inference_path} enhanced!")
+        logger.info(f"Audio from {args.inference_path} enhanced!")
 
 
 if __name__ == "__main__":
@@ -362,4 +317,5 @@ if __name__ == "__main__":
     )
     parser.add_argument("--inference-path", type=str, help="Run inference on example")
     parser.add_argument("--ort", action="store_true", help="Save to ort format")
+    parser.add_argument("--profiling", action="store_true", help="Run ONNX profiler")
     main(parser.parse_args())
