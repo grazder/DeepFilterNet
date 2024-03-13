@@ -13,6 +13,11 @@ torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 DEVICE = torch.device("cpu")
 
+EXAMPLES_PATH = ""
+AUDIO_EXAMPLE_PATH = (
+    "examples/A1CIM28ZUCA8RX_M_Street_Near_Regular_SP_Mobile_Primary.wav"
+)
+
 
 class TestTorchStreaming:
     def __reset(self):
@@ -29,14 +34,14 @@ class TestTorchStreaming:
         self.torch_streaming_no_stages = (
             self.torch_streaming_like_offline.torch_streaming_model
         )
-        self.streaming_state_no_stages = self.torch_streaming_like_offline.states
+        self.streaming_state_no_stages = self.torch_streaming_like_offline.states[0]
         self.atten_lim_db_no_stages = self.torch_streaming_like_offline.atten_lim_db
 
         pipeline_for_streaming = TorchDFPipeline(
             always_apply_all_stages=False, device=DEVICE
         )
         self.torch_streaming = pipeline_for_streaming.torch_streaming_model
-        self.streaming_state = pipeline_for_streaming.states
+        self.streaming_state = pipeline_for_streaming.states[0]
         self.atten_lim_db = pipeline_for_streaming.atten_lim_db
 
         pipeline_for_minmal_streaming = TorchDFMinimalPipeline(device=DEVICE)
@@ -51,7 +56,7 @@ class TestTorchStreaming:
         self.df_tract = DFTractPy()
 
         self.noisy_audio, self.audio_sr = torchaudio.load(
-            "examples/A1CIM28ZUCA8RX_M_Street_Near_Regular_SP_Mobile_Primary.wav",
+            AUDIO_EXAMPLE_PATH,
             channels_first=True,
         )
         self.noisy_audio = self.noisy_audio.mean(dim=0).unsqueeze(0).to(DEVICE)

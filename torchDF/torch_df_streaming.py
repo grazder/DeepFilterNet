@@ -899,6 +899,8 @@ if __name__ == "__main__":
         choices=["cuda", "cpu"],
         help="Device to run on",
     )
-    parser.add_argument("--always-apply-all-stages", action="store_true")
+    parser.add_argument(
+        "--always-apply-all-stages", action="store_true", help="Apply all stages or not"
+    )
 
     main(parser.parse_args())
