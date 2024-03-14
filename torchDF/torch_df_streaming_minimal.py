@@ -1094,10 +1094,6 @@ class TorchDFMinimalPipeline(nn.Module):
         )
         self.torch_streaming_model = self.torch_streaming_model.to(device)
 
-        erb_norm_state = torch.zeros(self.torch_streaming_model.erb_norm_state_shape)
-        band_unit_norm_state = torch.zeros(
-            self.torch_streaming_model.band_unit_norm_state_shape
-        )
         analysis_mem = torch.zeros(self.torch_streaming_model.analysis_mem_shape)
         synthesis_mem = torch.zeros(self.torch_streaming_model.synthesis_mem_shape)
         rolling_erb_buf = torch.zeros(self.torch_streaming_model.rolling_erb_buf_shape)
@@ -1124,6 +1120,7 @@ class TorchDFMinimalPipeline(nn.Module):
             .view(self.torch_streaming_model.erb_norm_state_shape)
             .to(torch.float32)
         )  # float() to fix export issue
+
         band_unit_norm_state = (
             torch.linspace(
                 self.torch_streaming_model.linspace_df[0],
