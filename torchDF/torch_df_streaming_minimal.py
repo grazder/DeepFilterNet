@@ -16,13 +16,11 @@ from typing import Tuple, List
 from df import init_df
 
 from functools import partial
-from typing import Callable, Iterable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple
 
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
-
-from loguru import logger
 
 from df.config import Csv, DfParams, config
 from df.modules import Conv2dNormAct, ConvTranspose2dNormAct

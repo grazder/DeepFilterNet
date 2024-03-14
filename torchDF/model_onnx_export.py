@@ -167,10 +167,13 @@ def custom_identity(g: jit_utils.GraphContext, X):
 
 
 def main(args):
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+
     if args.minimal:
         streaming_pipeline = TorchDFMinimalPipeline(device="cpu")
     else:
-        streaming_pipeline = TorchDFPipeline(device="cpu")
+        streaming_pipeline = TorchDFPipeline(device="cpu", always_apply_all_stages=True)
 
     frame_size = streaming_pipeline.hop_size
     input_names = streaming_pipeline.input_names
@@ -212,7 +215,7 @@ def main(args):
     input_shapes_dict = {x: y.shape for x, y in input_features_onnx.items()}
 
     # Simplify not working for not minimal!
-    if args.simplify and args.minimal:
+    if args.simplify:
         # raise NotImplementedError("Simplify not working for flatten states!")
         onnx_simplify(args.output_path, input_features_onnx, input_shapes_dict)
         logger.info(f"Model simplified! {args.output_path}")
