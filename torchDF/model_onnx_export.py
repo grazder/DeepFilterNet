@@ -171,7 +171,7 @@ def main(args):
     torch.set_num_interop_threads(1)
 
     if args.minimal:
-        streaming_pipeline = TorchDFMinimalPipeline(device="cpu")
+        streaming_pipeline = TorchDFMinimalPipeline(device="cpu", hop_size=512, fft_size=1024)
     else:
         streaming_pipeline = TorchDFPipeline(device="cpu", always_apply_all_stages=True)
 

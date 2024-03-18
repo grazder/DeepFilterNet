@@ -522,42 +522,7 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         self.nb_df = nb_df
 
         # Initializing erb features
-        self.erb_indices = torch.tensor(
-            [
-                2,
-                2,
-                2,
-                2,
-                2,
-                2,
-                2,
-                2,
-                2,
-                2,
-                2,
-                2,
-                2,
-                5,
-                5,
-                7,
-                7,
-                8,
-                10,
-                12,
-                13,
-                15,
-                18,
-                20,
-                24,
-                28,
-                31,
-                37,
-                42,
-                50,
-                56,
-                67,
-            ]
-        )
+        self.erb_indices = torch.tensor([1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 4, 5, 5, 6, 6, 8, 9, 11, 12, 14, 17, 18, 22, 26, 29, 34, 39, 45, 52, 61, 71])
         self.nb_bands = nb_bands
 
         self.register_buffer(
