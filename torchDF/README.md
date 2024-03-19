@@ -34,7 +34,7 @@ poetry run python torch_df_streaming_minimal.py --audio-path examples/A1CIM28ZUC
 
 To convert model to onnx and run tests:
 ```
-poetry run python model_onnx_export.py --test --performance --inference-path examples/A1CIM28ZUCA8RX_M_Street_Near_Regular_SP_Mobile_Primary.wav --ort
+poetry run python model_onnx_export.py --test --performance --inference-path examples/A1CIM28ZUCA8RX_M_Street_Near_Regular_SP_Mobile_Primary.wav --ort --simplify --profiling --minimal
 ```
 
 TODO:

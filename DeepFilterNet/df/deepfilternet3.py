@@ -28,7 +28,9 @@ class ModelParams(DfParams):
         self.conv_lookahead: int = config(
             "CONV_LOOKAHEAD", cast=int, default=0, section=self.section
         )
-        self.conv_ch: int = config("CONV_CH", cast=int, default=16, section=self.section)
+        self.conv_ch: int = config(
+            "CONV_CH", cast=int, default=16, section=self.section
+        )
         self.conv_depthwise: bool = config(
             "CONV_DEPTHWISE", cast=bool, default=True, section=self.section
         )
@@ -36,13 +38,22 @@ class ModelParams(DfParams):
             "CONVT_DEPTHWISE", cast=bool, default=True, section=self.section
         )
         self.conv_kernel: List[int] = config(
-            "CONV_KERNEL", cast=Csv(int), default=(1, 3), section=self.section  # type: ignore
+            "CONV_KERNEL",
+            cast=Csv(int),
+            default=(1, 3),
+            section=self.section,  # type: ignore
         )
         self.convt_kernel: List[int] = config(
-            "CONVT_KERNEL", cast=Csv(int), default=(1, 3), section=self.section  # type: ignore
+            "CONVT_KERNEL",
+            cast=Csv(int),
+            default=(1, 3),
+            section=self.section,  # type: ignore
         )
         self.conv_kernel_inp: List[int] = config(
-            "CONV_KERNEL_INP", cast=Csv(int), default=(3, 3), section=self.section  # type: ignore
+            "CONV_KERNEL_INP",
+            cast=Csv(int),
+            default=(3, 3),
+            section=self.section,  # type: ignore
         )
         self.emb_hidden_dim: int = config(
             "EMB_HIDDEN_DIM", cast=int, default=256, section=self.section
@@ -53,31 +64,49 @@ class ModelParams(DfParams):
         self.emb_gru_skip_enc: str = config(
             "EMB_GRU_SKIP_ENC", default="none", section=self.section
         )
-        self.emb_gru_skip: str = config("EMB_GRU_SKIP", default="none", section=self.section)
+        self.emb_gru_skip: str = config(
+            "EMB_GRU_SKIP", default="none", section=self.section
+        )
         self.df_hidden_dim: int = config(
             "DF_HIDDEN_DIM", cast=int, default=256, section=self.section
         )
-        self.df_gru_skip: str = config("DF_GRU_SKIP", default="none", section=self.section)
+        self.df_gru_skip: str = config(
+            "DF_GRU_SKIP", default="none", section=self.section
+        )
         self.df_pathway_kernel_size_t: int = config(
             "DF_PATHWAY_KERNEL_SIZE_T", cast=int, default=1, section=self.section
         )
-        self.enc_concat: bool = config("ENC_CONCAT", cast=bool, default=False, section=self.section)
-        self.df_num_layers: int = config("DF_NUM_LAYERS", cast=int, default=3, section=self.section)
-        self.df_n_iter: int = config("DF_N_ITER", cast=int, default=1, section=self.section)
-        self.lin_groups: int = config("LINEAR_GROUPS", cast=int, default=1, section=self.section)
+        self.enc_concat: bool = config(
+            "ENC_CONCAT", cast=bool, default=False, section=self.section
+        )
+        self.df_num_layers: int = config(
+            "DF_NUM_LAYERS", cast=int, default=3, section=self.section
+        )
+        self.df_n_iter: int = config(
+            "DF_N_ITER", cast=int, default=1, section=self.section
+        )
+        self.lin_groups: int = config(
+            "LINEAR_GROUPS", cast=int, default=1, section=self.section
+        )
         self.enc_lin_groups: int = config(
             "ENC_LINEAR_GROUPS", cast=int, default=16, section=self.section
         )
-        self.mask_pf: bool = config("MASK_PF", cast=bool, default=False, section=self.section)
+        self.mask_pf: bool = config(
+            "MASK_PF", cast=bool, default=False, section=self.section
+        )
         self.lsnr_dropout: bool = config(
             "LSNR_DROPOUT", cast=bool, default=False, section=self.section
         )
 
 
-def init_model(df_state: Optional[DF] = None, run_df: bool = True, train_mask: bool = True):
+def init_model(
+    df_state: Optional[DF] = None, run_df: bool = True, train_mask: bool = True
+):
     p = ModelParams()
     if df_state is None:
-        df_state = DF(sr=p.sr, fft_size=p.fft_size, hop_size=p.hop_size, nb_bands=p.nb_erb)
+        df_state = DF(
+            sr=p.sr, fft_size=p.fft_size, hop_size=p.hop_size, nb_bands=p.nb_erb
+        )
     erb = erb_fb(df_state.erb_widths(), p.sr, inverse=False)
     erb_inverse = erb_fb(df_state.erb_widths(), p.sr, inverse=True)
     model = DfNet(erb, erb_inverse, run_df, train_mask)
@@ -119,7 +148,11 @@ class Encoder(nn.Module):
         self.erb_conv3 = conv_layer(fstride=1)
         self.df_conv0_ch = p.conv_ch
         self.df_conv0 = Conv2dNormAct(
-            2, self.df_conv0_ch, kernel_size=p.conv_kernel_inp, bias=False, separable=True
+            2,
+            self.df_conv0_ch,
+            kernel_size=p.conv_kernel_inp,
+            bias=False,
+            separable=True,
         )
         self.df_conv1 = conv_layer(fstride=2)
         self.erb_bins = p.nb_erb
@@ -243,7 +276,15 @@ class ErbDecoder(nn.Module):
             p.conv_ch, 1, kernel_size=p.conv_kernel, activation_layer=nn.Sigmoid
         )
 
-    def forward(self, emb: Tensor, e3: Tensor, e2: Tensor, e1: Tensor, e0: Tensor, hidden: Tensor) -> Tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        emb: Tensor,
+        e3: Tensor,
+        e2: Tensor,
+        e1: Tensor,
+        e0: Tensor,
+        hidden: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
         # Estimates erb mask
         b, _, t, f8 = e3.shape
         emb, hidden = self.emb_gru(emb, hidden)
@@ -294,7 +335,9 @@ class DfDecoder(nn.Module):
         conv_layer = partial(Conv2dNormAct, separable=True, bias=False)
         kt = p.df_pathway_kernel_size_t
         self.conv_buffer_size = kt - 1
-        self.df_convp = conv_layer(layer_width, self.df_out_ch, fstride=1, kernel_size=(kt, 1))
+        self.df_convp = conv_layer(
+            layer_width, self.df_out_ch, fstride=1, kernel_size=(kt, 1)
+        )
 
         self.df_gru = SqueezedGRU_S(
             self.emb_in_dim,
@@ -313,7 +356,9 @@ class DfDecoder(nn.Module):
             assert p.emb_hidden_dim == p.df_hidden_dim, "Dimensions do not match"
             self.df_skip = nn.Identity()
         elif p.df_gru_skip == "groupedlinear":
-            self.df_skip = GroupedLinearEinsum(self.emb_in_dim, self.emb_dim, groups=p.lin_groups)
+            self.df_skip = GroupedLinearEinsum(
+                self.emb_in_dim, self.emb_dim, groups=p.lin_groups
+            )
         else:
             raise NotImplementedError()
         self.df_out: nn.Module
@@ -356,11 +401,15 @@ class DfNet(nn.Module):
         self.erb_bins: int = p.nb_erb
         if p.conv_lookahead > 0:
             assert p.conv_lookahead >= p.df_lookahead
-            self.pad_feat = nn.ConstantPad2d((0, 0, -p.conv_lookahead, p.conv_lookahead), 0.0)
+            self.pad_feat = nn.ConstantPad2d(
+                (0, 0, -p.conv_lookahead, p.conv_lookahead), 0.0
+            )
         else:
             self.pad_feat = nn.Identity()
         if p.df_lookahead > 0:
-            self.pad_spec = nn.ConstantPad3d((0, 0, 0, 0, p.df_lookahead - 1, -p.df_lookahead + 1), 0.0)
+            self.pad_spec = nn.ConstantPad3d(
+                (0, 0, 0, 0, p.df_lookahead - 1, -p.df_lookahead + 1), 0.0
+            )
         else:
             self.pad_spec = nn.Identity()
         self.register_buffer("erb_fb", erb_fb)
@@ -369,7 +418,9 @@ class DfNet(nn.Module):
         self.mask = Mask(erb_inv_fb, post_filter=p.mask_pf)
 
         self.df_order = p.df_order
-        self.df_op = MF.DF(num_freqs=p.nb_df, frame_size=p.df_order, lookahead=self.df_lookahead)
+        self.df_op = MF.DF(
+            num_freqs=p.nb_df, frame_size=p.df_order, lookahead=self.df_lookahead
+        )
         self.df_dec = DfDecoder()
         self.df_out_transform = DfOutputReshapeMF(self.df_order, p.nb_df)
 
@@ -406,7 +457,7 @@ class DfNet(nn.Module):
         # feat_erb = self.pad_feat(feat_erb)
         # feat_spec = self.pad_feat(feat_spec)
         spec = self.pad_spec(spec)
-        
+
         e0, e1, e2, e3, emb, c0, lsnr, _ = self.enc(feat_erb, feat_spec, hidden=None)
 
         if self.lsnr_droput:
@@ -427,7 +478,7 @@ class DfNet(nn.Module):
                 m[:, :, idcs], _ = self.erb_dec(emb, e3, e2, e1, e0, hidden=None)
             else:
                 m, _ = self.erb_dec(emb, e3, e2, e1, e0, hidden=None)
-            
+
             pad_spec = F.pad(spec, (0, 0, 0, 0, 1, -1, 0, 0), value=0)
             spec_m = self.mask(pad_spec, m)
         else:

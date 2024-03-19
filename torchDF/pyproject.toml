@@ -37,11 +37,13 @@ icecream = { version = ">=2,<3", optional = true }
 pystoi = { version = "^0.3", optional = true }
 pesq = { version = ">=0.0.3,<0.0.5", optional = true }
 scipy = { version = "^1", optional = true }
-onnxruntime = { version = "^1.15"}
+onnxruntime = "1.17"
 pytest = "^7.4.0"
 tqdm = "^4.65.0"
 onnx = "^1.14.0"
 onnxsim = "^0.4.33"
+onnxscript = "^0.1.0.dev20240131"
+onnxruntime-extensions = "^0.10.0"
 
 [tool.poetry.extras]
 train = ["deepfilterdataloader", "icecream"]
@@ -57,8 +59,8 @@ deep-filter-py = "df.enhance:run"
 poethepoet = "^0.21"
 
 [tool.poe.tasks]
-install-torch-cuda11 = "python -m pip install torch==2.1.0 torchaudio==2.1.0 --extra-index-url https://download.pytorch.org/whl/cu118/"
-install-torch-cpu = "python -m pip install torch==1.13.1 torchaudio==0.13.1 --extra-index-url https://download.pytorch.org/whl/cpu/"
+install-torch-cuda11 = "python -m pip install torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu118/"
+install-torch-cpu = "python -m pip install torch==2.1.0 torchaudio==2.1.0 --extra-index-url https://download.pytorch.org/whl/cpu/"
 install-eval-utils = "python -m pip install -r requirements_eval.txt"
 install-dnsmos-utils = "python -m pip install -r requirements_dnsmos.txt"
 
