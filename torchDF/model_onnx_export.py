@@ -126,9 +126,28 @@ def infer_onnx_model(
     )
 
     noisy_audio, sr = torchaudio.load(inference_path, channels_first=True)
-    noisy_audio = noisy_audio.mean(dim=0).unsqueeze(0)  # stereo to mono
+    noisy_audio = noisy_audio.mean(dim=0)  # stereo to mono
 
-    enhanced_audio = streaming_pipeline(noisy_audio, sr)
+    enhanced_audio = []
+
+    audio_chunks = torch.split(noisy_audio, streaming_pipeline.hop_size)
+    audio_chunks = [
+        x for x in audio_chunks if x.shape[0] == streaming_pipeline.hop_size
+    ]
+    states = streaming_pipeline.states
+
+    for chunk in audio_chunks:
+        enhanced_audio_frame, *states = (
+            torch.from_numpy(x)
+            for x in ort_session.run(
+                output_names,
+                generate_onnx_features([chunk, *states], input_names),
+            )
+        )
+
+        enhanced_audio.append(enhanced_audio_frame)
+
+    enhanced_audio = torch.cat(enhanced_audio).unsqueeze(0)
 
     torchaudio.save(
         inference_path.replace(".wav", "_onnx_infer.wav"),
