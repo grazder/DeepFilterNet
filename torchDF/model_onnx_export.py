@@ -15,6 +15,8 @@ from typing import Dict, Iterable
 from torch.onnx._internal import jit_utils
 from loguru import logger
 
+from df.enhance import parse_epoch_type
+
 torch.manual_seed(0)
 
 OPSET_VERSION = 17
@@ -171,9 +173,18 @@ def main(args):
     torch.set_num_interop_threads(1)
 
     if args.minimal:
-        streaming_pipeline = TorchDFMinimalPipeline(device="cpu", hop_size=512, fft_size=1024)
+        streaming_pipeline = TorchDFMinimalPipeline(
+            device="cpu",
+            model_base_dir=args.model_base_dir,
+            epoch=args.epoch
+        )
     else:
-        streaming_pipeline = TorchDFPipeline(device="cpu", always_apply_all_stages=True)
+        streaming_pipeline = TorchDFPipeline(
+            device="cpu",
+            always_apply_all_stages=True,
+            model_base_dir=args.model_base_dir,
+            epoch=args.epoch
+        )
 
     frame_size = streaming_pipeline.hop_size
     input_names = streaming_pipeline.input_names
@@ -314,4 +325,6 @@ if __name__ == "__main__":
     parser.add_argument("--ort", action="store_true", help="Save to ort format")
     parser.add_argument("--profiling", action="store_true", help="Run ONNX profiler")
     parser.add_argument("--minimal", action="store_true", help="Export minimal version")
+    parser.add_argument("--model-base-dir", type=str, default='DeepFilterNet3', help="Path to model base dir with \"checkpoints\" subdir")
+    parser.add_argument("-e", "--epoch", type=parse_epoch_type, default='best', help="Epoch for checkpoint loading. Can be one of ['best', 'latest', <int>].")
     main(parser.parse_args())

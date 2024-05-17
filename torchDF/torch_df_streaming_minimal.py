@@ -28,6 +28,7 @@ from df.modules import Conv2dNormAct, ConvTranspose2dNormAct
 from typing_extensions import Final
 from torch.nn.parameter import Parameter
 from torch.nn import init
+import numpy as np
 
 
 from torch.autograd import Function
@@ -485,6 +486,7 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         enc,
         df_dec,
         erb_dec,
+        erb_indices,
         df_order=5,
         lookahead=2,
         conv_lookahead=2,
@@ -520,9 +522,7 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         self.register_buffer("window", window)
 
         self.nb_df = nb_df
-
-        # Initializing erb features
-        self.erb_indices = torch.tensor([1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 4, 5, 5, 6, 6, 8, 9, 11, 12, 14, 17, 18, 22, 26, 29, 34, 39, 45, 52, 61, 71])
+        self.erb_indices = torch.from_numpy(erb_indices.astype(np.int64))
         self.nb_bands = nb_bands
 
         self.register_buffer(
@@ -1025,37 +1025,36 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
 class TorchDFMinimalPipeline(nn.Module):
     def __init__(
         self,
-        nb_bands=32,
-        hop_size=480,
-        fft_size=960,
-        df_order=5,
-        conv_lookahead=2,
-        nb_df=96,
         model_base_dir="DeepFilterNet3",
+        epoch="best",
         device="cpu",
     ):
         super().__init__()
-        self.hop_size = hop_size
-        self.fft_size = fft_size
 
         model, state, _ = init_df(
             config_allow_defaults=True,
             model_base_dir=model_base_dir,
+            epoch=epoch,
         )
         model.eval()
-        self.sample_rate = state.sr()
+        p = ModelParams()
 
+        self.hop_size = p.hop_size
+        self.fft_size = p.fft_size
+        self.sample_rate = p.sr
+        
         self.torch_streaming_model = ExportableStreamingMinimalTorchDF(
-            nb_bands=nb_bands,
-            hop_size=hop_size,
-            fft_size=fft_size,
+            nb_bands=p.nb_erb,
+            hop_size=p.hop_size,
+            fft_size=p.fft_size,
             enc=model.enc,
             df_dec=model.df_dec,
             erb_dec=model.erb_dec,
-            df_order=df_order,
-            conv_lookahead=conv_lookahead,
-            nb_df=nb_df,
+            df_order=p.df_order,
+            conv_lookahead=p.conv_lookahead,
+            nb_df=p.nb_df,
             sr=self.sample_rate,
+            erb_indices=state.erb_widths()
         )
         self.torch_streaming_model = self.torch_streaming_model.to(device)
 
