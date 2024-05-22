@@ -37,6 +37,8 @@ To convert model to onnx and run tests:
 poetry run python model_onnx_export.py --test --performance --inference-path examples/A1CIM28ZUCA8RX_M_Street_Near_Regular_SP_Mobile_Primary.wav --ort --simplify --profiling --minimal
 ```
 
+I also changed the hop_size parameter from 480 to 512 to speed up the stft. And then finetuned 3 epoches to adapt the model to size 512. New fast model can be found in `models/` dir.  
+
 TODO:
 * Issues about split + simplify
 * Thinkging of offline method exportability + compatability with streaming functions
