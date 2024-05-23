@@ -12,8 +12,10 @@ from torch.nn import functional as F
 from torch import nn
 from torch import Tensor
 from typing import Tuple
+import numpy as np
 
 from df import init_df
+from df.model import ModelParams
 
 
 class ExportableStreamingTorchDF(nn.Module):
@@ -25,6 +27,7 @@ class ExportableStreamingTorchDF(nn.Module):
         enc,
         df_dec,
         erb_dec,
+        erb_indices,
         df_order=5,
         lookahead=2,
         conv_lookahead=2,
@@ -60,44 +63,7 @@ class ExportableStreamingTorchDF(nn.Module):
         self.register_buffer("window", window)
 
         self.nb_df = nb_df
-
-        # Initializing erb features
-        self.erb_indices = torch.tensor(
-            [
-                2,
-                2,
-                2,
-                2,
-                2,
-                2,
-                2,
-                2,
-                2,
-                2,
-                2,
-                2,
-                2,
-                5,
-                5,
-                7,
-                7,
-                8,
-                10,
-                12,
-                13,
-                15,
-                18,
-                20,
-                24,
-                28,
-                31,
-                37,
-                42,
-                50,
-                56,
-                67,
-            ]
-        )
+        self.erb_indices = torch.from_numpy(erb_indices.astype(np.int64))
         self.nb_bands = nb_bands
 
         self.register_buffer(
@@ -758,39 +724,38 @@ class ExportableStreamingTorchDF(nn.Module):
 class TorchDFPipeline(nn.Module):
     def __init__(
         self,
-        nb_bands=32,
-        hop_size=480,
-        fft_size=960,
-        df_order=5,
-        conv_lookahead=2,
-        nb_df=96,
         model_base_dir="DeepFilterNet3",
-        atten_lim_db=0.0,
+        epoch="best",
         always_apply_all_stages=False,
+        atten_lim_db=0.0,
         device="cpu",
     ):
         super().__init__()
-        self.hop_size = hop_size
-        self.fft_size = fft_size
 
         model, state, _ = init_df(
-            config_allow_defaults=True, model_base_dir=model_base_dir
+            config_allow_defaults=True,
+            model_base_dir=model_base_dir,
+            epoch=epoch,
         )
         model.eval()
-        self.sample_rate = state.sr()
+        p = ModelParams()
 
+        self.hop_size = p.hop_size
+        self.fft_size = p.fft_size
+        self.sample_rate = p.sr
+        
         self.torch_streaming_model = ExportableStreamingTorchDF(
-            nb_bands=nb_bands,
-            hop_size=hop_size,
-            fft_size=fft_size,
+            nb_bands=p.nb_erb,
+            hop_size=p.hop_size,
+            fft_size=p.fft_size,
             enc=model.enc,
             df_dec=model.df_dec,
             erb_dec=model.erb_dec,
-            df_order=df_order,
-            always_apply_all_stages=always_apply_all_stages,
-            conv_lookahead=conv_lookahead,
-            nb_df=nb_df,
+            df_order=p.df_order,
+            conv_lookahead=p.conv_lookahead,
+            nb_df=p.nb_df,
             sr=self.sample_rate,
+            erb_indices=state.erb_widths()
         )
         self.torch_streaming_model = self.torch_streaming_model.to(device)
         self.atten_lim_db = torch.tensor(atten_lim_db, device=device)

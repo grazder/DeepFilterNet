@@ -37,6 +37,26 @@ To convert model to onnx and run tests:
 poetry run python model_onnx_export.py --test --performance --inference-path examples/A1CIM28ZUCA8RX_M_Street_Near_Regular_SP_Mobile_Primary.wav --ort --simplify --profiling --minimal
 ```
 
+I also changed the hop_size parameter from 480 to 512 to speed up the stft. And then finetuned 3 epoches to adapt the model to size 512. New fast model can be found in `models/` dir.  
+```
+../models
+├── DeepFilterNet3_torchDF
+│   ├── checkpoints/model_123.ckpt.best
+│   └── config.ini
+├── DeepFilterNet3_torchDF_onnx
+│   ├── denoiser_model.onnx
+│   ├── denoiser_model.ort
+│   └── denoiser_model.required_operators.config
+```
+
+How to convert new model to onnx:
+```sh
+# cd torchDF
+unzip ../models/DeepFilterNet3_torchDF.zip -d ../models/
+python model_onnx_export.py --performance --minimal --simplify --ort --model-base-dir ../models/DeepFilterNet3_torchDF
+```
+
+
 TODO:
 * Issues about split + simplify
 * Thinkging of offline method exportability + compatability with streaming functions
