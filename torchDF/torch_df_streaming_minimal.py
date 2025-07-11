@@ -113,12 +113,12 @@ class GroupedLinearEinsum(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.groups = groups
-        assert (
-            input_size % groups == 0
-        ), f"Input size {input_size} not divisible by {groups}"
-        assert (
-            hidden_size % groups == 0
-        ), f"Hidden size {hidden_size} not divisible by {groups}"
+        assert input_size % groups == 0, (
+            f"Input size {input_size} not divisible by {groups}"
+        )
+        assert hidden_size % groups == 0, (
+            f"Hidden size {hidden_size} not divisible by {groups}"
+        )
         self.ws = input_size // groups
         self.register_parameter(
             "weight",
@@ -408,7 +408,9 @@ class ErbDecoder(nn.Module):
         emb, hidden = self.emb_gru(emb, hidden)
         emb = emb.view(1, 1, f8, -1).permute(0, 3, 1, 2)  # [B, C*8, T, F/8]
         e3 = self.convt3(self.conv3p(e3) + emb)  # [B, C*4, T, F/4]
+
         e2 = self.convt2(self.conv2p(e2) + e3)  # [B, C*2, T, F/2]
+
         e1 = self.convt1(self.conv1p(e1) + e2)  # [B, C, T, F]
         m = self.conv0_out(self.conv0p(e0) + e1)  # [B, 1, T, F]
         return m, hidden
@@ -779,10 +781,9 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
 
     @staticmethod
     def band_unit_norm(
-        xs: Tensor, band_unit_norm_state, alpha: float
+        xs: Tensor, band_unit_norm_state: Tensor, alpha: float
     ) -> Tuple[Tensor, Tensor]:
         """
-        Original code - libDF/src/lib.rs - band_unit_norm()
         Normalizing Deep Filtering features. And updates the normalization state.
 
         Parameters:
@@ -794,9 +795,13 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
             output:                 Float[1, DF] - normalized deep filtering features
             band_unit_norm_state:   Float[1, DF, 1] - updated normalization state
         """
-        xs_abs = torch.linalg.norm(xs, dim=-1, keepdim=True)  # xs.abs() from complexxs
+        xs_abs = torch.sqrt(
+            torch.sum(xs.pow(2), dim=-1, keepdim=True)
+        )  # вычисляем L2-норму
+        # xs_abs = torch.linalg.norm(xs, dim=-1, keepdim=True)  # xs.abs() from complexxs
+
         new_band_unit_norm_state = xs_abs * (1 - alpha) + band_unit_norm_state * alpha
-        output = xs / new_band_unit_norm_state.sqrt()
+        output = xs / torch.sqrt(new_band_unit_norm_state)
 
         return output, new_band_unit_norm_state
 
@@ -843,13 +848,13 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         # x - [F=481, 2]
         # self.irfft_matrix - [fft_size=481, 2, f=960]
         # [f=960]
-        x = (
-            torch.einsum("fi,fij->j", x, self.irfft_matrix)
-            * self.fft_size
-            * self.window
-        )
+        # x = (
+        #     torch.einsum("fi,fij->j", x, self.irfft_matrix)
+        #     * self.fft_size
+        #     * self.window
+        # )
         # x = torch.cat([x[:, 0], torch.zeros(479)])
-        # x = torch.fft.irfft(torch.view_as_complex(x)) * self.fft_size * self.window
+        x = torch.fft.irfft(torch.view_as_complex(x)) * self.fft_size * self.window
 
         x_first, x_second = torch.split(
             x, [self.frame_size, self.window_size - self.frame_size]
@@ -872,7 +877,7 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         Returns:
             spec:   Float[F] - Spectrogram with applyed ERB gains
         """
-        gains = gains.matmul(self.inverse_erb_matrix)
+        gains = gains.unsqueeze(0).matmul(self.inverse_erb_matrix).squeeze(0)
         spec = spec * gains.unsqueeze(-1)
 
         return spec
@@ -939,9 +944,9 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
             enhanced_frame:     Float[t] - Enhanced audio frame
         """
         assert input_frame.ndim == 1, "only bs=1 and t=frame_size supported"
-        assert (
-            input_frame.shape[0] == self.frame_size
-        ), "input_frame must be bs=1 and t=frame_size"
+        assert input_frame.shape[0] == self.frame_size, (
+            "input_frame must be bs=1 and t=frame_size"
+        )
 
         spectrogram, new_analysis_mem = self.frame_analysis(input_frame, analysis_mem)
         spectrogram = spectrogram.unsqueeze(
@@ -1042,7 +1047,7 @@ class TorchDFMinimalPipeline(nn.Module):
         self.hop_size = p.hop_size
         self.fft_size = p.fft_size
         self.sample_rate = p.sr
-        
+
         self.torch_streaming_model = ExportableStreamingMinimalTorchDF(
             nb_bands=p.nb_erb,
             hop_size=p.hop_size,
@@ -1054,7 +1059,7 @@ class TorchDFMinimalPipeline(nn.Module):
             conv_lookahead=p.conv_lookahead,
             nb_df=p.nb_df,
             sr=self.sample_rate,
-            erb_indices=state.erb_widths()
+            erb_indices=state.erb_widths(),
         )
         self.torch_streaming_model = self.torch_streaming_model.to(device)
 
@@ -1151,12 +1156,12 @@ class TorchDFMinimalPipeline(nn.Module):
         Returns:
             enhanced_audio:   Float[1, t] - Enhanced input audio
         """
-        assert (
-            input_audio.shape[0] == 1
-        ), f"Only mono supported! Got wrong shape! {input_audio.shape}"
-        assert (
-            sample_rate == self.sample_rate
-        ), f"Only {self.sample_rate} supported! Got wrong sample rate! {sample_rate}"
+        assert input_audio.shape[0] == 1, (
+            f"Only mono supported! Got wrong shape! {input_audio.shape}"
+        )
+        assert sample_rate == self.sample_rate, (
+            f"Only {self.sample_rate} supported! Got wrong sample rate! {sample_rate}"
+        )
 
         input_audio = input_audio.squeeze(0)
         orig_len = input_audio.shape[0]

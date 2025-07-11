@@ -7,6 +7,7 @@ import torch
 import torchaudio
 import numpy as np
 import onnxruntime as ort
+import torch.nn.functional as F
 import torch.utils.benchmark as benchmark
 
 from torch_df_streaming_minimal import TorchDFMinimalPipeline
@@ -15,11 +16,264 @@ from typing import Dict, Iterable
 from torch.onnx._internal import jit_utils
 from loguru import logger
 
+from typing import Tuple, List, Optional, Union
+from torch.types import _int, _bool, Number, _dtype, _size
+from torch import nn, Tensor
 from df.enhance import parse_epoch_type
+from nobuco.converters.node_converter import converter
 
 torch.manual_seed(0)
 
 OPSET_VERSION = 17
+
+import keras
+import numbers
+
+
+@converter(nn.ConvTranspose2d)
+def converter_ConvTranspose2d(
+    self, input: Tensor, output_size: Optional[List[int]] = None
+):
+    weight = self.weight
+    bias = self.bias
+    groups = self.groups
+    padding = self.padding
+    stride = self.stride
+    dilation = self.dilation
+    output_padding = self.output_padding
+
+    if isinstance(dilation, numbers.Number):
+        dilation = (dilation, dilation)
+
+    if isinstance(padding, numbers.Number):
+        padding = (padding, padding)
+
+    if isinstance(output_padding, numbers.Number):
+        output_padding = (output_padding, output_padding)
+
+    in_filters, depth_multiplier, kh, kw = weight.shape
+    out_filters = groups * depth_multiplier
+
+    weights = weight.cpu().detach().numpy()
+    weights = weights.transpose((2, 3, 1, 0))  # (kh, kw, in_filters, out_filters)
+
+    if bias is not None:
+        biases = bias.cpu().detach().numpy()
+        params = [weights, biases]
+        use_bias = True
+    else:
+        params = [weights]
+        use_bias = False
+
+    if groups == 1:
+        conv = keras.layers.Conv2DTranspose(
+            out_filters,
+            kernel_size=(kh, kw),
+            strides=stride,
+            padding="valid",
+            dilation_rate=dilation,
+            groups=1,
+            use_bias=use_bias,
+            weights=params,
+        )
+    else:
+        weights = params[0]
+
+        weights_full = np.zeros(shape=(kh, kw, out_filters, in_filters))
+        for i in range(in_filters):
+            chunk = i // (in_filters // groups)
+            for d in range(depth_multiplier):
+                weights_full[..., chunk * depth_multiplier + d, i] = weights[..., d, i]
+        params[0] = weights_full
+
+        conv = keras.layers.Conv2DTranspose(
+            out_filters,
+            kernel_size=(kh, kw),
+            strides=stride,
+            padding="valid",
+            dilation_rate=dilation,
+            groups=1,
+            use_bias=use_bias,
+            weights=params,
+        )
+
+    def func(input: Tensor, output_size: Optional[List[int]] = None):
+        assert output_size is None
+
+        x = conv(input)
+
+        # Сначала учтём padding
+        if padding != (0, 0):
+            if padding[0] == 0:
+                x = x[:, :, padding[1] : -padding[1], :]
+            elif padding[1] == 0:
+                x = x[:, padding[0] : -padding[0], :]
+            else:
+                x = x[:, padding[0] : -padding[0], padding[1] : -padding[1], :]
+
+        # Теперь добавим output_padding
+        if output_padding != (0, 0):
+            hp, wp = output_padding
+            if hp >= 0 and wp >= 0:
+                pad_layer = keras.layers.ZeroPadding2D(padding=((0, hp), (0, wp)))
+                x = pad_layer(x)
+            else:
+                crop_layer = keras.layers.Cropping2D(cropping=((0, -hp), (0, -wp)))
+                x = crop_layer(x)
+
+        return x
+
+    return func
+
+
+def export_tflite(
+    model: torch.nn.Module,
+    input_data: Tuple[torch.Tensor],
+    input_names: List[str],
+    output_path: str,
+    enable_profiling: bool,
+) -> bool:
+    """
+    Export PyTorch model to TFLite with inference validation and benchmarking
+
+    Args:
+        model: PyTorch model to export
+        input_data: Example input data
+        input_names: Input tensor names
+        output_path: Output .tflite path
+        test_data: Optional test data for validation/benchmarking
+
+    Returns:
+        bool: True if export successful
+    """
+    try:
+        import nobuco
+        import tensorflow as tf
+        from torch.utils import benchmark
+    except ImportError as e:
+        logger.error(f"TFLite export requires nobuco and tensorflow: {e}")
+        return False
+
+    try:
+        # Prepare named inputs
+        named_inputs = {tensor: name for name, tensor in zip(input_names, input_data)}
+
+        # Convert to Keras
+        keras_model = nobuco.pytorch_to_keras(
+            model,
+            input_data,
+            input_names=named_inputs,
+            inputs_channel_order=nobuco.ChannelOrder.TENSORFLOW,
+            outputs_channel_order=nobuco.ChannelOrder.TENSORFLOW,
+        )
+
+        # Convert to TFLite
+        converter = tf.lite.TFLiteConverter.from_keras_model(keras_model)
+        converter.target_spec.supported_ops = [
+            tf.lite.OpsSet.SELECT_TF_OPS,
+            tf.lite.OpsSet.TFLITE_BUILTINS,
+        ]
+        if enable_profiling:
+            converter.optimizations = [tf.lite.Optimize.DEFAULT]
+            converter.experimental_new_converter = True
+        tflite_model = converter.convert()
+
+        # Save model
+        with open(output_path, "wb") as f:
+            f.write(tflite_model)
+
+        logger.success(f"TFLite model saved to {output_path}")
+
+        # Run inference and benchmark if test data provided
+        # Convert test data to numpy arrays
+
+        # Initialize TFLite interpreter
+        interpreter = tf.lite.Interpreter(model_path=output_path)
+        interpreter.allocate_tensors()
+
+        # Get input/output details
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+
+        input_mapping = {}
+        for detail in input_details:
+            # Extract base name without suffix (e.g., 'input:0' -> 'input')
+            base_name = detail["name"].split(":")[0]
+            # Remove serving_default_ prefix if present
+            clean_name = base_name.replace("serving_default_", "")
+            input_mapping[clean_name] = detail
+
+        # --------------------------
+        # Prepare test data dictionary
+        # --------------------------
+        test_data_dict = {}
+        for data, name in named_inputs.items():
+            # Convert to numpy if it's a tensor
+            np_data = (
+                data.detach().cpu().numpy() if isinstance(data, torch.Tensor) else data
+            )
+            test_data_dict[name] = np_data
+
+            # Log expected and actual shapes
+            if name in input_mapping:
+                expected_shape = tuple(input_mapping[name]["shape"])
+                actual_shape = np_data.shape
+                if expected_shape != actual_shape:
+                    logger.warning(
+                        f"Input '{name}' shape mismatch: "
+                        f"Model expects {expected_shape}, "
+                        f"got {actual_shape}"
+                    )
+            else:
+                logger.warning(f"Input '{name}' not found in model inputs")
+
+        # --------------------------
+        # Set input tensors
+        # --------------------------
+        for name, data in test_data_dict.items():
+            if name in input_mapping:
+                detail = input_mapping[name]
+                # Reshape data to match expected shape if possible
+                if np.prod(data.shape) == np.prod(detail["shape"]):
+                    data = data.reshape(detail["shape"])
+                interpreter.set_tensor(detail["index"], data)
+
+        interpreter.invoke()
+
+        # Get outputs
+        outputs = []
+        for detail in output_details:
+            output_data = interpreter.get_tensor(detail["index"])
+            outputs.append(output_data)
+
+        # --------------------------
+        # Benchmark performance
+        # --------------------------
+        def run_inference():
+            interpreter.invoke()
+
+        # Warm-up
+        for _ in range(10):
+            run_inference()
+
+        # Measure performance
+        timer = benchmark.Timer(
+            stmt="run_inference()",
+            globals={"run_inference": run_inference},
+            num_threads=1,
+        )
+
+        stats = timer.blocked_autorange(min_run_time=5)
+        median_time = stats.median * 1000  # Convert to ms
+        logger.info(
+            f"TFLite Inference Benchmark:\n- Median time: {median_time:.2f} ms\n"
+        )
+
+        return True
+
+    except Exception as e:
+        logger.exception(f"TFLite export failed: {e}")
+        return False
 
 
 def onnx_simplify(
@@ -78,9 +332,9 @@ def test_onnx_model(
 
         for x, y, name in zip(output_torch, output_onnx, output_names):
             y_tensor = torch.from_numpy(y)
-            assert torch.allclose(
-                x, y_tensor, atol=1e-2
-            ), f"out {name} - {i}, {x.flatten()[-5:]}, {y_tensor.flatten()[-5:]}"
+            assert torch.allclose(x, y_tensor, atol=1e-2), (
+                f"out {name} - {i}, {x.flatten()[-5:]}, {y_tensor.flatten()[-5:]}"
+            )
 
 
 def generate_onnx_features(input_features, input_names):
@@ -174,16 +428,14 @@ def main(args):
 
     if args.minimal:
         streaming_pipeline = TorchDFMinimalPipeline(
-            device="cpu",
-            model_base_dir=args.model_base_dir,
-            epoch=args.epoch
+            device="cpu", model_base_dir=args.model_base_dir, epoch=args.epoch
         )
     else:
         streaming_pipeline = TorchDFPipeline(
             device="cpu",
             always_apply_all_stages=True,
             model_base_dir=args.model_base_dir,
-            epoch=args.epoch
+            epoch=args.epoch,
         )
 
     frame_size = streaming_pipeline.hop_size
@@ -197,113 +449,125 @@ def main(args):
     input_features = (input_frame, *states)
     torch_df(*input_features)  # check model
 
-    torch.onnx.register_custom_op_symbolic(
-        symbolic_name="aten::fft_rfft",
-        symbolic_fn=custom_rfft,
-        opset_version=OPSET_VERSION,
-    )
-    # Only used with aten::fft_rfft, so it's useless in ONNX
-    torch.onnx.register_custom_op_symbolic(
-        symbolic_name="aten::view_as_real",
-        symbolic_fn=custom_identity,
-        opset_version=OPSET_VERSION,
-    )
+    if args.tflite:
+        tflite_path = args.output_path.replace(".onnx", ".tflite")
 
-    torch_df_script = torch.jit.script(torch_df)
-
-    torch.onnx.export(
-        torch_df_script,
-        input_features,
-        args.output_path,
-        verbose=False,
-        input_names=input_names,
-        output_names=output_names,
-        opset_version=OPSET_VERSION,
-    )
-    logger.info(f"Model exported to {args.output_path}!")
-
-    input_features_onnx = generate_onnx_features(input_features, input_names)
-    input_shapes_dict = {x: y.shape for x, y in input_features_onnx.items()}
-
-    # Simplify not working for not minimal!
-    if args.simplify:
-        # raise NotImplementedError("Simplify not working for flatten states!")
-        onnx_simplify(args.output_path, input_features_onnx, input_shapes_dict)
-        logger.info(f"Model simplified! {args.output_path}")
-
-    if args.ort:
-        if (
-            subprocess.run(
-                [
-                    "python",
-                    "-m",
-                    "onnxruntime.tools.convert_onnx_models_to_ort",
-                    args.output_path,
-                    "--optimization_style",
-                    "Fixed",
-                ]
-            ).returncode
-            != 0
-        ):
-            raise RuntimeError("ONNX to ORT conversion failed!")
-        logger.info("Model converted to ORT format!")
-
-    logger.info("Checking model...")
-    sess_options = ort.SessionOptions()
-    sess_options.graph_optimization_level = (
-        ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
-    )
-    sess_options.optimized_model_filepath = args.output_path
-    sess_options.intra_op_num_threads = 1
-    sess_options.inter_op_num_threads = 1
-    sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    sess_options.enable_profiling = args.profiling
-
-    ort_session = ort.InferenceSession(
-        args.output_path,
-        sess_options,
-        providers=["CPUExecutionProvider"],
-    )
-
-    for _ in range(3):
-        onnx_outputs = ort_session.run(
-            output_names,
-            input_features_onnx,
+        # Экспортируем оригинальную модель (не jit) в TFLite
+        success = export_tflite(
+            model=torch_df,
+            input_data=input_features,
+            input_names=input_names,
+            output_path=tflite_path,
+            enable_profiling=True,
+        )
+    else:
+        torch.onnx.register_custom_op_symbolic(
+            symbolic_name="aten::fft_rfft",
+            symbolic_fn=custom_rfft,
+            opset_version=OPSET_VERSION,
+        )
+        # Only used with aten::fft_rfft, so it's useless in ONNX
+        torch.onnx.register_custom_op_symbolic(
+            symbolic_name="aten::view_as_real",
+            symbolic_fn=custom_identity,
+            opset_version=OPSET_VERSION,
         )
 
-    if args.profiling:
-        logger.info("Profiling enabled...")
-        ort_session.end_profiling()
+        torch_df_script = torch.jit.script(torch_df)
 
-    logger.info(
-        f"InferenceSession successful! Output shapes: {[x.shape for x in onnx_outputs]}"
-    )
-
-    if args.test:
-        logger.info("Testing...")
-        test_onnx_model(
-            torch_df,
-            ort_session,
-            input_features[1:],
-            frame_size,
-            input_names,
-            output_names,
+        torch.onnx.export(
+            torch_df_script,
+            input_features,
+            args.output_path,
+            verbose=False,
+            input_names=input_names,
+            output_names=output_names,
+            opset_version=OPSET_VERSION,
         )
-        logger.info("Tests passed!")
+        logger.info(f"Model exported to {args.output_path}!")
 
-    if args.performance:
-        logger.info("Performanse check...")
-        perform_benchmark(ort_session, input_features_onnx, output_names)
+        input_features_onnx = generate_onnx_features(input_features, input_names)
+        input_shapes_dict = {x: y.shape for x, y in input_features_onnx.items()}
 
-    if args.inference_path:
-        infer_onnx_model(
-            streaming_pipeline,
-            ort_session,
-            args.inference_path,
-            input_names,
-            output_names,
+        # Simplify not working for not minimal!
+        if args.simplify:
+            # raise NotImplementedError("Simplify not working for flatten states!")
+            onnx_simplify(args.output_path, input_features_onnx, input_shapes_dict)
+            logger.info(f"Model simplified! {args.output_path}")
+
+        if args.ort:
+            if (
+                subprocess.run(
+                    [
+                        "python",
+                        "-m",
+                        "onnxruntime.tools.convert_onnx_models_to_ort",
+                        args.output_path,
+                        "--optimization_style",
+                        "Fixed",
+                    ]
+                ).returncode
+                != 0
+            ):
+                raise RuntimeError("ONNX to ORT conversion failed!")
+            logger.info("Model converted to ORT format!")
+
+        logger.info("Checking model...")
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = (
+            ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
         )
-        logger.info(f"Audio from {args.inference_path} enhanced!")
+        sess_options.optimized_model_filepath = args.output_path
+        sess_options.intra_op_num_threads = 1
+        sess_options.inter_op_num_threads = 1
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        sess_options.enable_profiling = args.profiling
+
+        ort_session = ort.InferenceSession(
+            args.output_path,
+            sess_options,
+            providers=["CPUExecutionProvider"],
+        )
+
+        for _ in range(3):
+            onnx_outputs = ort_session.run(
+                output_names,
+                input_features_onnx,
+            )
+
+        if args.profiling:
+            logger.info("Profiling enabled...")
+            ort_session.end_profiling()
+
+        logger.info(
+            f"InferenceSession successful! Output shapes: {[x.shape for x in onnx_outputs]}"
+        )
+
+        if args.test:
+            logger.info("Testing...")
+            test_onnx_model(
+                torch_df,
+                ort_session,
+                input_features[1:],
+                frame_size,
+                input_names,
+                output_names,
+            )
+            logger.info("Tests passed!")
+
+        if args.performance:
+            logger.info("Performanse check...")
+            perform_benchmark(ort_session, input_features_onnx, output_names)
+
+        if args.inference_path:
+            infer_onnx_model(
+                streaming_pipeline,
+                ort_session,
+                args.inference_path,
+                input_names,
+                output_names,
+            )
+            logger.info(f"Audio from {args.inference_path} enhanced!")
 
 
 if __name__ == "__main__":
@@ -315,6 +579,7 @@ if __name__ == "__main__":
         help="Path to output onnx file",
     )
     parser.add_argument("--simplify", action="store_true", help="Simplify the model")
+    parser.add_argument("--tflite", action="store_true", help="Export to tflite")
     parser.add_argument("--test", action="store_true", help="Test the onnx model")
     parser.add_argument(
         "--performance",
@@ -325,6 +590,17 @@ if __name__ == "__main__":
     parser.add_argument("--ort", action="store_true", help="Save to ort format")
     parser.add_argument("--profiling", action="store_true", help="Run ONNX profiler")
     parser.add_argument("--minimal", action="store_true", help="Export minimal version")
-    parser.add_argument("--model-base-dir", type=str, default='DeepFilterNet3', help="Path to model base dir with \"checkpoints\" subdir")
-    parser.add_argument("-e", "--epoch", type=parse_epoch_type, default='best', help="Epoch for checkpoint loading. Can be one of ['best', 'latest', <int>].")
+    parser.add_argument(
+        "--model-base-dir",
+        type=str,
+        default="DeepFilterNet3",
+        help='Path to model base dir with "checkpoints" subdir',
+    )
+    parser.add_argument(
+        "-e",
+        "--epoch",
+        type=parse_epoch_type,
+        default="best",
+        help="Epoch for checkpoint loading. Can be one of ['best', 'latest', <int>].",
+    )
     main(parser.parse_args())
