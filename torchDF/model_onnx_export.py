@@ -126,6 +126,23 @@ def converter_ConvTranspose2d(
     return func
 
 
+def transpose_input_data(data, name):
+    new_tensor = None
+
+    if "rolling" in name and len(data.shape) == 4:
+        new_tensor = data.permute(0, 2, 3, 1)
+    else:
+        # b_t_ch -> b_ch_t
+        if len(data.shape) == 3:
+            new_tensor = data.permute(0, 2, 1)
+        elif len(data.shape) == 4:
+            new_tensor = data.permute(0, 3, 1, 2)
+        else:
+            new_tensor = data
+
+    return new_tensor
+
+
 def export_tflite(
     model: torch.nn.Module,
     input_data: Tuple[torch.Tensor],
@@ -210,7 +227,9 @@ def export_tflite(
         for data, name in named_inputs.items():
             # Convert to numpy if it's a tensor
             np_data = (
-                data.detach().cpu().numpy() if isinstance(data, torch.Tensor) else data
+                transpose_input_data(data, name).detach().cpu().numpy()
+                if isinstance(data, torch.Tensor)
+                else data
             )
             test_data_dict[name] = np_data
 
