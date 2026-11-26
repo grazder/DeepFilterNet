@@ -22,6 +22,17 @@ each `new_*` output back into its matching input on the next frame. The bundled
 TorchDF checkpoint takes 512 samples per frame at 48 kHz. Use `--minimal` in
 place of `--web` to export the baseline for comparison.
 
+`--fp16-gru` optionally stores the GRU weight matrices in FP16. The exported
+graph casts them back to FP32, keeping the same input, output, and state types.
+Use a separate output filename, such as `denoiser_web_fp16.onnx`, to keep both
+variants available. The smaller artifact rounds the weights to FP16.
+
+`--compact-state` reduces the spectral buffers passed between frames. It can
+be combined with `--fp16-gru`. For the bundled checkpoint, initialize
+`rolling_spec_buf_x` with shape `[4, 96, 2]` and `rolling_spec_buf_y` with
+shape `[2, 417, 2]`. Read the shapes from the model metadata when using a
+different checkpoint and reset these buffers when switching models.
+
 ### Development and tests
 
 Installation:

@@ -135,6 +135,59 @@ def infer_onnx_model(
     )
 
 
+def pack_gru_weights_fp16(path):
+    model = onnx.load(path)
+    graph = model.graph
+    weights = {
+        name
+        for node in graph.node
+        if node.op_type == "GRU" and not node.domain
+        for name in node.input[1:3]
+    }
+    constants = {
+        node.output[0]: node
+        for node in graph.node
+        if node.op_type == "Constant" and not node.domain
+    }
+    initializers = {tensor.name: tensor for tensor in graph.initializer}
+    casts = {}
+    for name in sorted(weights):
+        node = constants.get(name)
+        tensor = (
+            next((attr.t for attr in node.attribute if attr.name == "value"), None)
+            if node is not None
+            else initializers.get(name)
+        )
+        if tensor is None or tensor.data_type != onnx.TensorProto.FLOAT:
+            raise ValueError(f"Expected a static FP32 GRU weight: {name}")
+        values = onnx.numpy_helper.to_array(tensor).astype(np.float16)
+        if not np.isfinite(values).all():
+            raise ValueError(f"GRU weights cannot be represented in FP16: {name}")
+        packed_name = name + "_packed_fp16"
+        tensor.CopyFrom(onnx.numpy_helper.from_array(values, name=packed_name))
+        if node is not None:
+            node.output[0] = packed_name
+        casts[name] = onnx.helper.make_node(
+            "Cast", [packed_name], [name], to=onnx.TensorProto.FLOAT
+        )
+
+    if not casts:
+        raise ValueError("Expected at least one GRU weight tensor")
+    nodes = [cast for name, cast in casts.items() if name in initializers]
+    for node in graph.node:
+        nodes.append(node)
+        if node.op_type == "Constant" and node.output[0].endswith("_packed_fp16"):
+            name = node.output[0].removesuffix("_packed_fp16")
+            if name in casts:
+                nodes.append(casts[name])
+
+    del graph.node[:]
+    graph.node.extend(nodes)
+    onnx.checker.check_model(model, full_check=True)
+    onnx.save(model, path)
+    logger.info(f"Stored {len(casts)} GRU weight tensors in FP16")
+
+
 # setType API provides shape/type to ONNX shape/type inference
 def custom_rfft(g: jit_utils.GraphContext, X, n, dim, norm):
     x = g.op(
@@ -180,6 +233,7 @@ def main(args):
             model_base_dir=args.model_base_dir,
             epoch=args.epoch,
             web_fft=args.web,
+            compact_state=args.compact_state,
         )
     else:
         streaming_pipeline = TorchDFPipeline(
@@ -251,6 +305,9 @@ def main(args):
         # raise NotImplementedError("Simplify not working for flatten states!")
         onnx_simplify(args.output_path, input_features_onnx, input_shapes_dict)
         logger.info(f"Model simplified! {args.output_path}")
+
+    if args.fp16_gru:
+        pack_gru_weights_fp16(args.output_path)
 
     if args.ort:
         if (
@@ -357,7 +414,22 @@ if __name__ == "__main__":
         action="store_true",
         help="Export the minimal model with standard ONNX DFT and web initial states",
     )
+    parser.add_argument(
+        "--fp16-gru",
+        action="store_true",
+        help="Store web GRU weights in FP16 and compute in FP32",
+    )
+    parser.add_argument(
+        "--compact-state",
+        action="store_true",
+        help="Export smaller spectral states with different ONNX input and output shapes",
+    )
     parser.add_argument("--minimal", action="store_true", help="Export minimal version")
     parser.add_argument("--model-base-dir", type=str, default='DeepFilterNet3', help="Path to model base dir with \"checkpoints\" subdir")
     parser.add_argument("-e", "--epoch", type=parse_epoch_type, default='best', help="Epoch for checkpoint loading. Can be one of ['best', 'latest', <int>].")
-    main(parser.parse_args())
+    args = parser.parse_args()
+    if args.fp16_gru and not args.web:
+        parser.error("--fp16-gru requires --web")
+    if args.compact_state and not args.web:
+        parser.error("--compact-state requires --web")
+    main(args)

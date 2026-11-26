@@ -500,6 +500,7 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         silence_thresh=1e-7,
         sr=48000,
         web_fft=False,
+        compact_state=False,
     ):
         # All complex numbers are stored as floats for ONNX compatibility
         super().__init__()
@@ -612,6 +613,13 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
             self.freq_size,
             2,
         )  # [number of specs to save, ...]
+        self.compact_state = compact_state
+        self.delayed_spec_index = self.df_order - 1 - conv_lookahead
+        if compact_state:
+            if not 0 <= conv_lookahead < self.df_order or not 0 < self.nb_df < self.freq_size:
+                raise ValueError("Compact state requires a valid lookahead and frequency split")
+            self.rolling_spec_buf_x_shape = (self.df_order - 1, self.nb_df, 2)
+            self.rolling_spec_buf_y_shape = (conv_lookahead, self.freq_size - self.nb_df, 2)
         self.enc_hidden_shape = (
             1,
             1,
@@ -942,11 +950,20 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         spectrogram = spectrogram.unsqueeze(
             0
         )  # [1, freq_size, 2] reshape needed for easier stacking buffers
-        new_rolling_spec_buf_x = torch.cat(
-            [rolling_spec_buf_x[1:, ...], spectrogram]
-        )  # [n_frames=5, 481, 2]
-        # rolling_spec_buf_y - [n_frames=7, 481, 2] n_frames=7 for compatability with original code, but in code we use only one frame
-        new_rolling_spec_buf_y = torch.cat([rolling_spec_buf_y[1:, ...], spectrogram])
+        if self.compact_state:
+            # Low bins share the deep-filter history; high bins only need lookahead.
+            filter_spectra = torch.cat((rolling_spec_buf_x, spectrogram[:, : self.nb_df]))
+            high_spectra = torch.cat((rolling_spec_buf_y, spectrogram[:, self.nb_df :]))
+            current_spec = torch.cat(
+                (filter_spectra[self.delayed_spec_index], high_spectra[0])
+            )
+            new_rolling_spec_buf_x = filter_spectra[1:]
+            new_rolling_spec_buf_y = high_spectra[1:]
+        else:
+            new_rolling_spec_buf_x = torch.cat((rolling_spec_buf_x[1:], spectrogram))
+            new_rolling_spec_buf_y = torch.cat((rolling_spec_buf_y[1:], spectrogram))
+            filter_spectra = new_rolling_spec_buf_x
+            current_spec = new_rolling_spec_buf_y[self.df_order - 1]
 
         erb_feat, new_erb_norm_state = self.band_mean_norm_erb(
             self.erb(spectrogram).squeeze(0), erb_norm_state, alpha=self.alpha
@@ -990,10 +1007,9 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         coefs = new_coefs.view(self.nb_df, -1, 2).permute(1, 0, 2)
 
         # Applying features
-        current_spec = new_rolling_spec_buf_y[self.df_order - 1]
         current_spec = self.apply_mask(current_spec.clone(), gains)
         current_spec = self.deep_filter(
-            current_spec.clone(), coefs, new_rolling_spec_buf_x
+            current_spec.clone(), coefs, filter_spectra
         )
 
         enhanced_audio_frame, new_synthesis_mem = self.frame_synthesis(
@@ -1024,6 +1040,7 @@ class TorchDFMinimalPipeline(nn.Module):
         epoch="best",
         device="cpu",
         web_fft=False,
+        compact_state=False,
     ):
         super().__init__()
 
@@ -1052,6 +1069,7 @@ class TorchDFMinimalPipeline(nn.Module):
             sr=self.sample_rate,
             erb_indices=state.erb_widths(),
             web_fft=web_fft,
+            compact_state=compact_state,
         )
         self.torch_streaming_model = self.torch_streaming_model.to(device)
 
