@@ -1,13 +1,15 @@
 import copy
+import json
 import onnx
 import argparse
 import subprocess
+from pathlib import Path
+from time import perf_counter
 
 import torch
 import torchaudio
 import numpy as np
 import onnxruntime as ort
-import torch.utils.benchmark as benchmark
 
 from torch_df_streaming_minimal import TorchDFMinimalPipeline
 from torch_df_streaming import TorchDFPipeline
@@ -76,6 +78,9 @@ def test_onnx_model(
             generate_onnx_features([input_frame, *states_onnx], input_names),
         )
 
+        states_torch = output_torch[1:]
+        states_onnx = [torch.from_numpy(value) for value in output_onnx[1:]]
+
         for x, y, name in zip(output_torch, output_onnx, output_names):
             y_tensor = torch.from_numpy(y)
             assert torch.allclose(
@@ -87,28 +92,17 @@ def generate_onnx_features(input_features, input_names):
     return {x: y.detach().cpu().numpy() for x, y in zip(input_names, input_features)}
 
 
-def perform_benchmark(ort_session, input_features: Dict[str, np.ndarray], output_names):
-    """
-    Benchmark ONNX model performance
-
-    Parameters:
-        ort_session:    onnxruntime.InferenceSession - Inference Session for converted ONNX model
-        input_features: Dict[str, np.ndarray] - Input features
-    """
-
-    def run_onnx():
-        output = ort_session.run(
-            output_names,
-            input_features,
-        )
-
-    t0 = benchmark.Timer(
-        stmt="run_onnx()",
-        num_threads=1,
-        globals={"run_onnx": run_onnx},
-    )
+def perform_benchmark(ort_session, input_features, output_names, budget_ms):
+    samples_ms = []
+    for index in range(550):
+        started = perf_counter()
+        ort_session.run(output_names, input_features)
+        if index >= 50:
+            samples_ms.append((perf_counter() - started) * 1e3)
+    samples_ms.sort()
     logger.info(
-        f"Median iteration time: {t0.blocked_autorange(min_run_time=10).median * 1e3:6.2f} ms / {480 / 48000 * 1000} ms"
+        f"Frame latency p50: {samples_ms[250]:.2f} ms, "
+        f"p95: {samples_ms[475]:.2f} ms, frame budget: {budget_ms:.2f} ms"
     )
 
 
@@ -141,6 +135,59 @@ def infer_onnx_model(
     )
 
 
+def pack_gru_weights_fp16(path):
+    model = onnx.load(path)
+    graph = model.graph
+    weights = {
+        name
+        for node in graph.node
+        if node.op_type == "GRU" and not node.domain
+        for name in node.input[1:3]
+    }
+    constants = {
+        node.output[0]: node
+        for node in graph.node
+        if node.op_type == "Constant" and not node.domain
+    }
+    initializers = {tensor.name: tensor for tensor in graph.initializer}
+    casts = {}
+    for name in sorted(weights):
+        node = constants.get(name)
+        tensor = (
+            next((attr.t for attr in node.attribute if attr.name == "value"), None)
+            if node is not None
+            else initializers.get(name)
+        )
+        if tensor is None or tensor.data_type != onnx.TensorProto.FLOAT:
+            raise ValueError(f"Expected a static FP32 GRU weight: {name}")
+        values = onnx.numpy_helper.to_array(tensor).astype(np.float16)
+        if not np.isfinite(values).all():
+            raise ValueError(f"GRU weights cannot be represented in FP16: {name}")
+        packed_name = name + "_packed_fp16"
+        tensor.CopyFrom(onnx.numpy_helper.from_array(values, name=packed_name))
+        if node is not None:
+            node.output[0] = packed_name
+        casts[name] = onnx.helper.make_node(
+            "Cast", [packed_name], [name], to=onnx.TensorProto.FLOAT
+        )
+
+    if not casts:
+        raise ValueError("Expected at least one GRU weight tensor")
+    nodes = [cast for name, cast in casts.items() if name in initializers]
+    for node in graph.node:
+        nodes.append(node)
+        if node.op_type == "Constant" and node.output[0].endswith("_packed_fp16"):
+            name = node.output[0].removesuffix("_packed_fp16")
+            if name in casts:
+                nodes.append(casts[name])
+
+    del graph.node[:]
+    graph.node.extend(nodes)
+    onnx.checker.check_model(model, full_check=True)
+    onnx.save(model, path)
+    logger.info(f"Stored {len(casts)} GRU weight tensors in FP16")
+
+
 # setType API provides shape/type to ONNX shape/type inference
 def custom_rfft(g: jit_utils.GraphContext, X, n, dim, norm):
     x = g.op(
@@ -163,6 +210,14 @@ def custom_rfft(g: jit_utils.GraphContext, X, n, dim, norm):
     return x
 
 
+def custom_ifft(g: jit_utils.GraphContext, x, n, dim, norm):
+    # The input already has the real/imaginary dimension required by ONNX.
+    batch_axis = g.op("Constant", value_t=torch.tensor([0], dtype=torch.int64))
+    x = g.op("Unsqueeze", x, batch_axis)
+    x = g.op("DFT", x, axis_i=1, inverse_i=1, onesided_i=0)
+    return g.op("Squeeze", x, batch_axis)
+
+
 # setType API provides shape/type to ONNX shape/type inference
 def custom_identity(g: jit_utils.GraphContext, X):
     return X
@@ -172,11 +227,13 @@ def main(args):
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
 
-    if args.minimal:
+    if args.minimal or args.web:
         streaming_pipeline = TorchDFMinimalPipeline(
             device="cpu",
             model_base_dir=args.model_base_dir,
-            epoch=args.epoch
+            epoch=args.epoch,
+            web_fft=args.web,
+            compact_state=args.compact_state,
         )
     else:
         streaming_pipeline = TorchDFPipeline(
@@ -202,12 +259,20 @@ def main(args):
         symbolic_fn=custom_rfft,
         opset_version=OPSET_VERSION,
     )
-    # Only used with aten::fft_rfft, so it's useless in ONNX
+    # ONNX DFT already represents complex numbers with a trailing dimension of 2.
     torch.onnx.register_custom_op_symbolic(
         symbolic_name="aten::view_as_real",
         symbolic_fn=custom_identity,
         opset_version=OPSET_VERSION,
     )
+
+    if args.web:
+        torch.onnx.register_custom_op_symbolic(
+            "aten::view_as_complex", custom_identity, OPSET_VERSION
+        )
+        torch.onnx.register_custom_op_symbolic(
+            "aten::fft_ifft", custom_ifft, OPSET_VERSION
+        )
 
     torch_df_script = torch.jit.script(torch_df)
 
@@ -222,6 +287,16 @@ def main(args):
     )
     logger.info(f"Model exported to {args.output_path}!")
 
+    if args.web:
+        state_path = Path(args.output_path).with_suffix(".states.json")
+        nonzero_states = {
+            name: state.flatten().tolist()
+            for name, state in zip(input_names[1:], states)
+            if torch.count_nonzero(state).item()
+        }
+        state_path.write_text(json.dumps(nonzero_states) + "\n", encoding="utf-8")
+        logger.info(f"Initial states exported to {state_path}")
+
     input_features_onnx = generate_onnx_features(input_features, input_names)
     input_shapes_dict = {x: y.shape for x, y in input_features_onnx.items()}
 
@@ -230,6 +305,9 @@ def main(args):
         # raise NotImplementedError("Simplify not working for flatten states!")
         onnx_simplify(args.output_path, input_features_onnx, input_shapes_dict)
         logger.info(f"Model simplified! {args.output_path}")
+
+    if args.fp16_gru:
+        pack_gru_weights_fp16(args.output_path)
 
     if args.ort:
         if (
@@ -253,7 +331,9 @@ def main(args):
     sess_options.graph_optimization_level = (
         ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
     )
-    sess_options.optimized_model_filepath = args.output_path
+    # Keep the portable ONNX artifact separate from native ORT graph fusions.
+    if not args.web:
+        sess_options.optimized_model_filepath = args.output_path
     sess_options.intra_op_num_threads = 1
     sess_options.inter_op_num_threads = 1
     sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
@@ -292,8 +372,13 @@ def main(args):
         logger.info("Tests passed!")
 
     if args.performance:
-        logger.info("Performanse check...")
-        perform_benchmark(ort_session, input_features_onnx, output_names)
+        logger.info("Measuring inference latency...")
+        perform_benchmark(
+            ort_session,
+            input_features_onnx,
+            output_names,
+            budget_ms=1000 * frame_size / streaming_pipeline.sample_rate,
+        )
 
     if args.inference_path:
         infer_onnx_model(
@@ -319,12 +404,32 @@ if __name__ == "__main__":
     parser.add_argument(
         "--performance",
         action="store_true",
-        help="Mesure median iteration time for onnx model",
+        help="Measure median and p95 frame latency",
     )
     parser.add_argument("--inference-path", type=str, help="Run inference on example")
     parser.add_argument("--ort", action="store_true", help="Save to ort format")
     parser.add_argument("--profiling", action="store_true", help="Run ONNX profiler")
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Export the minimal model with standard ONNX DFT and web initial states",
+    )
+    parser.add_argument(
+        "--fp16-gru",
+        action="store_true",
+        help="Store web GRU weights in FP16 and compute in FP32",
+    )
+    parser.add_argument(
+        "--compact-state",
+        action="store_true",
+        help="Export smaller spectral states with different ONNX input and output shapes",
+    )
     parser.add_argument("--minimal", action="store_true", help="Export minimal version")
     parser.add_argument("--model-base-dir", type=str, default='DeepFilterNet3', help="Path to model base dir with \"checkpoints\" subdir")
     parser.add_argument("-e", "--epoch", type=parse_epoch_type, default='best', help="Epoch for checkpoint loading. Can be one of ['best', 'latest', <int>].")
-    main(parser.parse_args())
+    args = parser.parse_args()
+    if args.fp16_gru and not args.web:
+        parser.error("--fp16-gru requires --web")
+    if args.compact_state and not args.web:
+        parser.error("--compact-state requires --web")
+    main(args)

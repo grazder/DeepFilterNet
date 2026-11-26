@@ -2,6 +2,39 @@
 
 Commit against which the comparison was made - https://github.com/Rikorose/DeepFilterNet/commit/ca46bf54afaf8ace3272aaee5931b4317bd6b5f4
 
+### Export to ONNX with uv
+
+From the repository root, install the export environment with uv and Python 3.10.
+The export environment installs the published `deepfilterlib` wheel.
+
+```sh
+unzip -n models/DeepFilterNet3_torchDF.zip -d models/
+PYTHONPATH="$PWD/DeepFilterNet" uv run --locked --project torchDF/export --python 3.10 \
+  python torchDF/model_onnx_export.py --web --test --performance \
+  --model-base-dir models/DeepFilterNet3_torchDF --output-path denoiser_web.onnx
+```
+
+`--web` selects the minimal streaming model with standard ONNX DFT nodes for
+analysis and synthesis. Use ONNX Runtime Web with the WASM execution provider.
+Use the flattened initial values from `denoiser_web.states.json` and the shapes
+from the ONNX input metadata. Initialize other state inputs to zero and feed
+each `new_*` output back into its matching input on the next frame. The bundled
+TorchDF checkpoint takes 512 samples per frame at 48 kHz. Use `--minimal` in
+place of `--web` to export the baseline for comparison.
+
+`--fp16-gru` optionally stores the GRU weight matrices in FP16. The exported
+graph casts them back to FP32, keeping the same input, output, and state types.
+Use a separate output filename, such as `denoiser_web_fp16.onnx`, to keep both
+variants available. The smaller artifact rounds the weights to FP16.
+
+`--compact-state` reduces the spectral buffers passed between frames. It can
+be combined with `--fp16-gru`. For the bundled checkpoint, initialize
+`rolling_spec_buf_x` with shape `[4, 96, 2]` and `rolling_spec_buf_y` with
+shape `[2, 417, 2]`. Read the shapes from the model metadata when using a
+different checkpoint and reset these buffers when switching models.
+
+### Development and tests
+
 Installation:
 ```
 cd path/to/DeepFilterNet/
@@ -19,7 +52,7 @@ poe install-torch-cpu
 
 Here is presented offline and streaming implementation of DeepFilterNet3 on pure torch. Streaming model can be fully exported to ONNX using `model_onnx_export.py`.
 
-Every script and test have to run inside poetry enviroment.
+The following development and test commands use the Poetry environment.
 
 To run tests:
 ```
@@ -30,11 +63,6 @@ We compare this model to existing `enhance` method (which is partly written on R
 To enhance audio using streaming implementation:
 ```
 poetry run python torch_df_streaming_minimal.py --audio-path examples/A1CIM28ZUCA8RX_M_Street_Near_Regular_SP_Mobile_Primary.wav --output-path examples/A1CIM28ZUCA8RX_M_Street_Near_Regular_SP_Mobile_Primary_enhanced.wav
-```
-
-To convert model to onnx and run tests:
-```
-poetry run python model_onnx_export.py --test --performance --inference-path examples/A1CIM28ZUCA8RX_M_Street_Near_Regular_SP_Mobile_Primary.wav --ort --simplify --profiling --minimal
 ```
 
 I also changed the hop_size parameter from 480 to 512 to speed up the stft. And then finetuned 3 epoches to adapt the model to size 512. New fast model can be found in `models/` dir.  
@@ -48,14 +76,6 @@ I also changed the hop_size parameter from 480 to 512 to speed up the stft. And 
 │   ├── denoiser_model.ort
 │   └── denoiser_model.required_operators.config
 ```
-
-How to convert new model to onnx:
-```sh
-# cd torchDF
-unzip ../models/DeepFilterNet3_torchDF.zip -d ../models/
-python model_onnx_export.py --performance --minimal --simplify --ort --model-base-dir ../models/DeepFilterNet3_torchDF
-```
-
 
 TODO:
 * Issues about split + simplify
