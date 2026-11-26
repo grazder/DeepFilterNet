@@ -14,6 +14,7 @@ from torch import Tensor
 from typing import Tuple, List
 
 from df import init_df
+from web_fft import WebIRFFT
 
 from functools import partial
 from typing import Callable, List, Optional, Tuple
@@ -498,6 +499,7 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         normalize_atten_lim=20.0,
         silence_thresh=1e-7,
         sr=48000,
+        web_fft=False,
     ):
         # All complex numbers are stored as floats for ONNX compatibility
         super().__init__()
@@ -557,15 +559,13 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
 
         self.alpha = alpha
 
-        # RFFT
-        # FFT operations are performed as matmuls for ONNX compatability
-        self.register_buffer(
-            "rfft_matrix",
-            torch.view_as_real(torch.fft.rfft(torch.eye(self.window_size))).transpose(
-                0, 1
-            ),
-        )
-        self.register_buffer("irfft_matrix", torch.linalg.pinv(self.rfft_matrix))
+        self.web_fft = WebIRFFT(fft_size) if web_fft else None
+        if web_fft:
+            self.register_buffer("irfft_matrix", None, persistent=False)
+        else:
+            basis = torch.view_as_real(torch.fft.rfft(torch.eye(fft_size))).transpose(0, 1)
+            self.register_buffer("rfft_matrix", basis)
+            self.register_buffer("irfft_matrix", torch.linalg.pinv(basis))
 
         # Thresholds
         self.register_buffer("min_db_thresh", torch.tensor([min_db_thresh]))
@@ -818,7 +818,6 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
         # First part of the window on the previous frame
         # Second part of the window on the new input frame
         buf = torch.cat([analysis_mem, input_frame]) * self.window
-        # rfft_buf = torch.matmul(buf, self.rfft_matrix) * self.wnorm
         rfft_buf = torch.view_as_real(torch.fft.rfft(buf)) * self.wnorm
 
         # Copy input to analysis_mem for next iteration
@@ -840,16 +839,12 @@ class ExportableStreamingMinimalTorchDF(nn.Module):
             output:         Float[f] - Enhanced audio
             synthesis_mem:  Float[f] - Saving current frame
         """
-        # x - [F=481, 2]
-        # self.irfft_matrix - [fft_size=481, 2, f=960]
-        # [f=960]
-        x = (
-            torch.einsum("fi,fij->j", x, self.irfft_matrix)
-            * self.fft_size
-            * self.window
-        )
-        # x = torch.cat([x[:, 0], torch.zeros(479)])
-        # x = torch.fft.irfft(torch.view_as_complex(x)) * self.fft_size * self.window
+        if self.web_fft is not None:
+            x = self.web_fft(x)
+        else:
+            assert self.irfft_matrix is not None
+            x = torch.einsum("fi,fij->j", x, self.irfft_matrix)
+        x = x * self.fft_size * self.window
 
         x_first, x_second = torch.split(
             x, [self.frame_size, self.window_size - self.frame_size]
@@ -1028,6 +1023,7 @@ class TorchDFMinimalPipeline(nn.Module):
         model_base_dir="DeepFilterNet3",
         epoch="best",
         device="cpu",
+        web_fft=False,
     ):
         super().__init__()
 
@@ -1054,7 +1050,8 @@ class TorchDFMinimalPipeline(nn.Module):
             conv_lookahead=p.conv_lookahead,
             nb_df=p.nb_df,
             sr=self.sample_rate,
-            erb_indices=state.erb_widths()
+            erb_indices=state.erb_widths(),
+            web_fft=web_fft,
         )
         self.torch_streaming_model = self.torch_streaming_model.to(device)
 

@@ -6,6 +6,7 @@ assets/hostbs.ini
 .cache*
 out/
 export/
+!torchDF/export/
 assets/valid_cache*
 DeepFilterNet/poetry.lock
 

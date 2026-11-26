@@ -1,13 +1,15 @@
 import copy
+import json
 import onnx
 import argparse
 import subprocess
+from pathlib import Path
+from time import perf_counter
 
 import torch
 import torchaudio
 import numpy as np
 import onnxruntime as ort
-import torch.utils.benchmark as benchmark
 
 from torch_df_streaming_minimal import TorchDFMinimalPipeline
 from torch_df_streaming import TorchDFPipeline
@@ -76,6 +78,9 @@ def test_onnx_model(
             generate_onnx_features([input_frame, *states_onnx], input_names),
         )
 
+        states_torch = output_torch[1:]
+        states_onnx = [torch.from_numpy(value) for value in output_onnx[1:]]
+
         for x, y, name in zip(output_torch, output_onnx, output_names):
             y_tensor = torch.from_numpy(y)
             assert torch.allclose(
@@ -87,28 +92,17 @@ def generate_onnx_features(input_features, input_names):
     return {x: y.detach().cpu().numpy() for x, y in zip(input_names, input_features)}
 
 
-def perform_benchmark(ort_session, input_features: Dict[str, np.ndarray], output_names):
-    """
-    Benchmark ONNX model performance
-
-    Parameters:
-        ort_session:    onnxruntime.InferenceSession - Inference Session for converted ONNX model
-        input_features: Dict[str, np.ndarray] - Input features
-    """
-
-    def run_onnx():
-        output = ort_session.run(
-            output_names,
-            input_features,
-        )
-
-    t0 = benchmark.Timer(
-        stmt="run_onnx()",
-        num_threads=1,
-        globals={"run_onnx": run_onnx},
-    )
+def perform_benchmark(ort_session, input_features, output_names, budget_ms):
+    samples_ms = []
+    for index in range(550):
+        started = perf_counter()
+        ort_session.run(output_names, input_features)
+        if index >= 50:
+            samples_ms.append((perf_counter() - started) * 1e3)
+    samples_ms.sort()
     logger.info(
-        f"Median iteration time: {t0.blocked_autorange(min_run_time=10).median * 1e3:6.2f} ms / {480 / 48000 * 1000} ms"
+        f"Frame latency p50: {samples_ms[250]:.2f} ms, "
+        f"p95: {samples_ms[475]:.2f} ms, frame budget: {budget_ms:.2f} ms"
     )
 
 
@@ -163,6 +157,14 @@ def custom_rfft(g: jit_utils.GraphContext, X, n, dim, norm):
     return x
 
 
+def custom_ifft(g: jit_utils.GraphContext, x, n, dim, norm):
+    # The input already has the real/imaginary dimension required by ONNX.
+    batch_axis = g.op("Constant", value_t=torch.tensor([0], dtype=torch.int64))
+    x = g.op("Unsqueeze", x, batch_axis)
+    x = g.op("DFT", x, axis_i=1, inverse_i=1, onesided_i=0)
+    return g.op("Squeeze", x, batch_axis)
+
+
 # setType API provides shape/type to ONNX shape/type inference
 def custom_identity(g: jit_utils.GraphContext, X):
     return X
@@ -172,11 +174,12 @@ def main(args):
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
 
-    if args.minimal:
+    if args.minimal or args.web:
         streaming_pipeline = TorchDFMinimalPipeline(
             device="cpu",
             model_base_dir=args.model_base_dir,
-            epoch=args.epoch
+            epoch=args.epoch,
+            web_fft=args.web,
         )
     else:
         streaming_pipeline = TorchDFPipeline(
@@ -202,12 +205,20 @@ def main(args):
         symbolic_fn=custom_rfft,
         opset_version=OPSET_VERSION,
     )
-    # Only used with aten::fft_rfft, so it's useless in ONNX
+    # ONNX DFT already represents complex numbers with a trailing dimension of 2.
     torch.onnx.register_custom_op_symbolic(
         symbolic_name="aten::view_as_real",
         symbolic_fn=custom_identity,
         opset_version=OPSET_VERSION,
     )
+
+    if args.web:
+        torch.onnx.register_custom_op_symbolic(
+            "aten::view_as_complex", custom_identity, OPSET_VERSION
+        )
+        torch.onnx.register_custom_op_symbolic(
+            "aten::fft_ifft", custom_ifft, OPSET_VERSION
+        )
 
     torch_df_script = torch.jit.script(torch_df)
 
@@ -221,6 +232,16 @@ def main(args):
         opset_version=OPSET_VERSION,
     )
     logger.info(f"Model exported to {args.output_path}!")
+
+    if args.web:
+        state_path = Path(args.output_path).with_suffix(".states.json")
+        nonzero_states = {
+            name: state.flatten().tolist()
+            for name, state in zip(input_names[1:], states)
+            if torch.count_nonzero(state).item()
+        }
+        state_path.write_text(json.dumps(nonzero_states) + "\n", encoding="utf-8")
+        logger.info(f"Initial states exported to {state_path}")
 
     input_features_onnx = generate_onnx_features(input_features, input_names)
     input_shapes_dict = {x: y.shape for x, y in input_features_onnx.items()}
@@ -253,7 +274,9 @@ def main(args):
     sess_options.graph_optimization_level = (
         ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
     )
-    sess_options.optimized_model_filepath = args.output_path
+    # Keep the portable ONNX artifact separate from native ORT graph fusions.
+    if not args.web:
+        sess_options.optimized_model_filepath = args.output_path
     sess_options.intra_op_num_threads = 1
     sess_options.inter_op_num_threads = 1
     sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
@@ -292,8 +315,13 @@ def main(args):
         logger.info("Tests passed!")
 
     if args.performance:
-        logger.info("Performanse check...")
-        perform_benchmark(ort_session, input_features_onnx, output_names)
+        logger.info("Measuring inference latency...")
+        perform_benchmark(
+            ort_session,
+            input_features_onnx,
+            output_names,
+            budget_ms=1000 * frame_size / streaming_pipeline.sample_rate,
+        )
 
     if args.inference_path:
         infer_onnx_model(
@@ -319,11 +347,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--performance",
         action="store_true",
-        help="Mesure median iteration time for onnx model",
+        help="Measure median and p95 frame latency",
     )
     parser.add_argument("--inference-path", type=str, help="Run inference on example")
     parser.add_argument("--ort", action="store_true", help="Save to ort format")
     parser.add_argument("--profiling", action="store_true", help="Run ONNX profiler")
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Export the minimal model with standard ONNX DFT and web initial states",
+    )
     parser.add_argument("--minimal", action="store_true", help="Export minimal version")
     parser.add_argument("--model-base-dir", type=str, default='DeepFilterNet3', help="Path to model base dir with \"checkpoints\" subdir")
     parser.add_argument("-e", "--epoch", type=parse_epoch_type, default='best', help="Epoch for checkpoint loading. Can be one of ['best', 'latest', <int>].")
